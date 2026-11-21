@@ -99,6 +99,8 @@ class Inkling2 : public Model {
   int prefill_chunk() const override { return tmax_; }
   bool can_snapshot() const override { return false; }
   bool grouped_passes() const override { return true; }
+  bool use_tensor() const { return use_tensor_; }
+  void set_use_tensor(bool on);
 
   void set_mem_budget(size_t bytes) override { mem_budget_ = bytes; }
   std::unique_ptr<Seq> new_seq(int limit, int initial = -1) override;
@@ -119,6 +121,7 @@ class Inkling2 : public Model {
   Buffer logits_buf() const { return logits_; }
   void encode_logits_rows(Encoder& e, Seq& s, int pos0, int T, const Buffer& out);
   void encode_prefill_diag(Encoder& e, Seq& s, int pos0, int T, const Buffer& diag_rows);
+  int debug_tensor_unit_check();
 
  private:
   void load();
@@ -151,6 +154,7 @@ class Inkling2 : public Model {
   int tmax_ = 512;
   int ring_rows_ = 0;
   size_t mem_budget_ = 0;
+  bool use_tensor_ = false;
 
   // Reusable activations sized for `tmax_` rows
   Buffer x_, x_pre_, inp_sa_, ffn_inp_, h_norm_;
@@ -159,10 +163,12 @@ class Inkling2 : public Model {
   Buffer ar_out_;           // attn_res output: up to 4 * tmax * H
   Buffer msg_out_;          // cross-pass messages: 4 * tmax * H
   Buffer mg_cat_, mg_lat_;  // split MessageGate staging buffers (T <= 16)
+  Buffer mg_f_, mg_g_;
   Buffer n0_, n1_, n2_;     // normed inputs [tmax, H]
   Buffer q_, k_, v_, r_, sinks_, gate_attn_, att_out_, a_out_;
   Buffer dyn_, rb_, part_m_, part_l_, part_o_;
   Buffer h_mlp_, x_mlp_, rlog_, eid_, ew_, moe_act_, moe_out_;
+  Buffer moe_tiles_, moe_ntiles_, moe_st_tok_, moe_st_pair_, moe_st_ew_, moe_pair_out_;
   Buffer logits_, cand_v_, cand_i_, sprob_, samp_;
 };
 

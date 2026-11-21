@@ -162,6 +162,12 @@ const DefaultRow kDefaults[] = {
     // unchanged; 1,024 rows against precise: 86 top-1 flips, mean KL 0.137, inside its bar (MLX on the same pack).
     {"a4_qtm_fast", Knob::kA4QtmFast, ModelClass::kOther, DefaultScope::kMatrix, nullptr, "on", 56, 58, false,
      "M5 Max; fast profile only", true},
+    // Fast profile only (docs/profiles.md): Inkling-2-Mini prefill on the matrix units
+    // (src/kernels/inkling2_tensor/ink2_tensor.metal, NI_INK2_TENSOR: BF16/F32 GEMM > 32 rows, batched MessageGate
+    // <= 2560 hidden, bucketed 128-expert NVFP4/MXFP8 MoE, chunk-invariant tiled D=128 SWA/global attention). M5 Max,
+    // 3 interleaved rounds: 663-5,701 tok prefill +712 to +811% (38 tok +73%); 192 step rows: 0 flips, mean KL 9.58e-4.
+    {"ink2_tensor_fast", Knob::kInk2TensorFast, ModelClass::kOther, DefaultScope::kMatrix, nullptr, "on", 712, 811,
+     false, "M5 Max; fast profile only", true},
 };
 
 bool guard_matches(const char* id, const DeviceProfile& dev) {

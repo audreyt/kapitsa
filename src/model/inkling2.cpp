@@ -1,5 +1,7 @@
 #include "model/inkling2.h"
 
+#include "engine/device_profile.h"
+#include "engine/profile.h"
 #include "model/inkling2_kernels.h"
 #include "model/kparams.h"
 #include "model/sampler.h"
@@ -45,6 +47,52 @@ Pipeline ink2_pipe(const std::string& name) {
   const Pipeline p = ink2::pipeline(name);
   std::lock_guard<std::mutex> lk(mu);
   return cache.emplace(name, p).first->second;
+}
+
+Pipeline ink2_tpipe(const std::string& name) {
+  static std::mutex mu;
+  static std::unordered_map<std::string, Pipeline> cache;
+  {
+    std::lock_guard<std::mutex> lk(mu);
+    auto it = cache.find(name);
+    if (it != cache.end()) return it->second;
+  }
+  const Pipeline p = ink2::tensor_pipeline(name);
+  std::lock_guard<std::mutex> lk(mu);
+  return cache.emplace(name, p).first->second;
+}
+
+bool want_ink2_tensor() {
+  static const bool on = [] {
+    bool here = false;
+    if (__builtin_available(macOS 26.0, *)) here = default_on(Knob::kInk2TensorFast, ModelFacts{});
+    return profile_switch("NI_INK2_TENSOR", here, "Inkling-2 prefill on the matrix units (NI_INK2_TENSOR)");
+  }();
+  return on;
+}
+
+bool init_tensor_kernels() {
+  static std::mutex mu;
+  std::lock_guard<std::mutex> lk(mu);
+  Gpu::PipelineRecovery rec;
+  try {
+    ink2::compile_tensor_kernels();
+    static const char* const kTensorNames[] = {
+        "ink2_bf16_mm_t",     "ink2_msg_gate_prep",    "ink2_msg_gate_mix",    "ink2_moe_bucket",
+        "ink2_moe_nvfp4_w13_t","ink2_moe_nvfp4_w2_t",  "ink2_moe_mxfp8_w13_t", "ink2_moe_mxfp8_w2_t",
+        "ink2_moe_reduce8",   "ink2_attn_prefill_t",
+    };
+    for (const char* name : kTensorNames) {
+      if (!ink2::tensor_pipeline(name, /*required=*/false).pso) {
+        logi("Inkling2: Metal 4 tensor kernel %s unavailable; falling back to Metal 3", name);
+        return false;
+      }
+    }
+    return true;
+  } catch (const std::exception& ex) {
+    logi("Inkling2: Metal 4 tensor kernels unavailable (%s); falling back to Metal 3", ex.what());
+    return false;
+  }
 }
 
 Pipeline base_pipe(const std::string& name) {
@@ -399,7 +447,17 @@ Inkling2::Inkling2(const std::string& path, int prefill_chunk) {
   ring_rows_ = (cfg_.swa + tmax_ + 15) / 16 * 16;
   ink2::compile_kernels();
   prewarm_pipelines();
+  use_tensor_ = want_ink2_tensor() && init_tensor_kernels();
   load();
+}
+
+void Inkling2::set_use_tensor(bool on) {
+  if (!on) {
+    use_tensor_ = false;
+    return;
+  }
+  if (!moe_pair_out_) fatal("inkling2: tensor buffers not allocated (restart with KAPITSA_PROFILE=fast or NI_INK2_TENSOR=1)");
+  use_tensor_ = init_tensor_kernels();
 }
 
 Inkling2::~Inkling2() {
@@ -622,8 +680,20 @@ void Inkling2::alloc_buffers() {
   for (int i = 0; i < 4; ++i) prelude_blocks_[i] = alloc(T * H * 4, "ink2_pre_block");
   ar_out_ = alloc(4 * T * H * 4, "ink2_ar");
   msg_out_ = alloc(4 * T * H * 4, "ink2_msg");
-  mg_cat_ = alloc(3 * 16 * 2 * H * 4, "ink2_mg_cat");
-  mg_lat_ = alloc(3 * 16 * size_t(cfg_.gate_rank) * 4, "ink2_mg_lat");
+  mg_cat_ = alloc(std::max<size_t>(use_tensor_ ? T : 0, 3 * 16) * 2 * H * 4, "ink2_mg_cat");
+  mg_lat_ = alloc(std::max<size_t>(use_tensor_ ? T : 0, 3 * 16) * size_t(cfg_.gate_rank) * 4, "ink2_mg_lat");
+  if (use_tensor_) {
+    const size_t r_max = T * size_t(cfg_.top_k);
+    const size_t max_tiles = std::max<size_t>((r_max + 31) / 32 + size_t(cfg_.n_experts) + 4, size_t(cfg_.n_experts) + 4);
+    mg_f_ = alloc(T * H * 4, "ink2_mg_f");
+    mg_g_ = alloc(T * H * 4, "ink2_mg_g");
+    moe_tiles_ = alloc(max_tiles * 3 * 4, "ink2_moe_tiles");
+    moe_ntiles_ = alloc(16, "ink2_moe_ntiles");
+    moe_st_tok_ = alloc(r_max * 4, "ink2_moe_st_tok");
+    moe_st_pair_ = alloc(r_max * 4, "ink2_moe_st_pair");
+    moe_st_ew_ = alloc(r_max * 4, "ink2_moe_st_ew");
+    moe_pair_out_ = alloc(r_max * H * 4, "ink2_moe_pair_out");
+  }
   n0_ = alloc(T * H * 4, "ink2_n0");
   n1_ = alloc(T * H * 4, "ink2_n1");
   n2_ = alloc(T * H * 4, "ink2_n2");
@@ -868,12 +938,13 @@ void Inkling2::enc_mm(Encoder& e, const Tensor& w, const Buffer& x, const Buffer
     }
   } else {
     const Ink2MmP p{uint32_t(M), N, K, K, N, w.dtype == DType::F32 ? 1u : 0u, add ? 1u : 0u};
-    e.use(ink2_pipe("ink2_bf16_mm"));
+    const bool t = use_tensor_;
+    e.use(t ? ink2_tpipe("ink2_bf16_mm_t") : ink2_pipe("ink2_bf16_mm"));
     e.buf(0, x);
     e.buf(1, w.buf);
     e.buf(2, y);
     e.val(3, p);
-    e.dispatch((N + 63) / 64, (uint32_t(M) + 31) / 32, 1, 128);
+    e.dispatch((N + 63) / 64, (uint32_t(M) + (t ? 63u : 31u)) / (t ? 64u : 32u), 1, 128);
   }
 }
 
@@ -906,6 +977,32 @@ void Inkling2::enc_attn_res(Encoder& e, const Buffer* const* states, int M, cons
 }
 
 void Inkling2::enc_msg_gate(Encoder& e, const Ink2Ctrl& c, const Buffer& h, const Buffer& m, const Buffer& out, int T) {
+  if (use_tensor_ && T >= 32 && cfg_.hidden <= 2560 && (cfg_.hidden & 3) == 0) {
+    const uint32_t H = uint32_t(cfg_.hidden);
+    const struct { uint32_t T, H; float eps; } pp{uint32_t(T), H, cfg_.rms_eps};
+    e.use(ink2_tpipe("ink2_msg_gate_prep"));
+    e.buf(0, h);
+    e.buf(1, m);
+    e.buf(2, mg_cat_);
+    e.val(3, pp);
+    e.dispatch(uint32_t(T), 1, 1, 512);
+    enc_mm(e, *c.down, mg_cat_, mg_lat_, T);
+    e.group_begin();
+    enc_mm(e, *c.forget, mg_lat_, mg_f_, T);
+    enc_mm(e, *c.gain, mg_lat_, mg_g_, T);
+    e.group_end();
+    const uint32_t n = uint32_t(T) * H;
+    const struct { uint32_t n; } mp{n};
+    e.use(ink2_tpipe("ink2_msg_gate_mix"));
+    e.buf(0, h);
+    e.buf(1, m);
+    e.buf(2, mg_f_);
+    e.buf(3, mg_g_);
+    e.buf(4, out);
+    e.val(5, mp);
+    e.dispatch(((n + 3) / 4 + 255) / 256, 1, 1, 256);
+    return;
+  }
   const Ink2MsgGateP p{uint32_t(T), uint32_t(cfg_.hidden), uint32_t(cfg_.gate_rank),
                        c.down->dtype == DType::F32 ? 1u : 0u, cfg_.rms_eps};
   if (T <= 16) {
@@ -969,9 +1066,10 @@ void Inkling2::enc_msg_gate3(Encoder& e, const Ink2Layer& L, const Buffer* const
     e.group_end();
     return;
   }
-  e.group_begin();
+  const bool batched_mg = use_tensor_ && T >= 32 && cfg_.hidden <= 2560 && (cfg_.hidden & 3) == 0;
+  if (!batched_mg) e.group_begin();
   for (int i = 0; i < 3; ++i) enc_msg_gate(e, *cs[i], *in_ptrs[i], *ms[i], *outs[i], T);
-  e.group_end();
+  if (!batched_mg) e.group_end();
 }
 
 void Inkling2::enc_forward(Encoder& e, Seq& s, int pos0, int T, bool dump_logits, const Buffer* out_logits,
@@ -1303,7 +1401,8 @@ void Inkling2::enc_forward(Encoder& e, Seq& s, int pos0, int T, bool dump_logits
                             L.is_swa ? 1u : 0u,
                             uint32_t(cfg_.swa),
                             attn_scale};
-      e.use(ink2_pipe("ink2_attn_prefill"));
+      const bool attn_t = use_tensor_ && T >= 32 && cfg_.head_dim == 128;
+      e.use(attn_t ? ink2_tpipe("ink2_attn_prefill_t") : ink2_pipe("ink2_attn_prefill"));
       e.buf(0, q_);
       e.buf(1, s.kc[v_idx]);
       e.buf(2, s.vc[v_idx]);
@@ -1312,7 +1411,8 @@ void Inkling2::enc_forward(Encoder& e, Seq& s, int pos0, int T, bool dump_logits
       e.buf(5, gate_attn_);
       e.buf(6, att_out_);
       e.val(7, apf);
-      e.dispatch(uint32_t(cfg_.hq), uint32_t(T), 1, 128);
+      if (attn_t) e.dispatch((uint32_t(T) + 15) / 16, uint32_t(cfg_.hq), 1, 128);
+      else e.dispatch(uint32_t(cfg_.hq), uint32_t(T), 1, 128);
     }
 
     // wo_ud + attn_sconv (+ *cur_x residual on non-boundary layers -> ffn_inp_)
@@ -1365,7 +1465,53 @@ void Inkling2::enc_forward(Encoder& e, Seq& s, int pos0, int T, bool dump_logits
     }
     {
       const Ink2MoeP mp{uint32_t(T), H, uint32_t(cfg_.moe_I), uint32_t(cfg_.top_k)};
-      if (!L.is_mxfp8) {
+      if (use_tensor_ && T >= 32 && cfg_.n_experts == 128) {
+        const struct { uint32_t T, K_top, E; } bp{uint32_t(T), uint32_t(cfg_.top_k), uint32_t(cfg_.n_experts)};
+        e.use(ink2_tpipe("ink2_moe_bucket"));
+        e.buf(0, eid_);
+        e.buf(1, ew_);
+        e.buf(2, moe_tiles_);
+        e.buf(3, moe_ntiles_);
+        e.buf(4, moe_st_tok_);
+        e.buf(5, moe_st_pair_);
+        e.buf(6, moe_st_ew_);
+        e.val(7, bp);
+        e.dispatch(1, 1, 1, 128);
+
+        const uint32_t max_tiles = (uint32_t(T) * uint32_t(cfg_.top_k) + 31u) / 32u + uint32_t(cfg_.n_experts);
+        int b = 0;
+        e.use(ink2_tpipe(L.is_mxfp8 ? "ink2_moe_mxfp8_w13_t" : "ink2_moe_nvfp4_w13_t"));
+        e.buf(b++, x_mlp_);
+        e.buf(b++, L.w13->buf);
+        e.buf(b++, L.w13_sc->buf);
+        if (!L.is_mxfp8) e.buf(b++, L.w13_outer);
+        e.buf(b++, moe_tiles_);
+        e.buf(b++, moe_ntiles_);
+        e.buf(b++, moe_st_tok_);
+        e.buf(b++, moe_act_);
+        e.val(b, mp);
+        e.dispatch((uint32_t(cfg_.moe_I) + 31) / 32, max_tiles, 1, 128);
+
+        b = 0;
+        e.use(ink2_tpipe(L.is_mxfp8 ? "ink2_moe_mxfp8_w2_t" : "ink2_moe_nvfp4_w2_t"));
+        e.buf(b++, moe_act_);
+        e.buf(b++, L.w2->buf);
+        e.buf(b++, L.w2_sc->buf);
+        if (!L.is_mxfp8) e.buf(b++, L.w2_outer);
+        e.buf(b++, moe_tiles_);
+        e.buf(b++, moe_ntiles_);
+        e.buf(b++, moe_st_pair_);
+        e.buf(b++, moe_st_ew_);
+        e.buf(b++, moe_pair_out_);
+        e.val(b, mp);
+        e.dispatch((H + 63) / 64, max_tiles, 1, 128);
+
+        e.use(ink2_tpipe("ink2_moe_reduce8"));
+        e.buf(0, moe_pair_out_);
+        e.buf(1, moe_out_);
+        e.val(2, mp);
+        e.dispatch(((H / 4) + 63) / 64, uint32_t(T), 1, 64);
+      } else if (!L.is_mxfp8) {
         e.use(ink2_pipe("ink2_moe_nvfp4_w13_situ"));
         e.buf(0, x_mlp_);
         e.buf(1, eid_);
@@ -1524,6 +1670,169 @@ void Inkling2::encode_prefill_diag(Encoder& e, Seq& s, int pos0, int T, const Bu
   if (T > tmax_) fatal("prefill chunk %d > %d", T, tmax_);
   if (pos0 + T >= s.cap) fatal("context full (%d)", s.cap);
   enc_forward(e, s, pos0, T, true, nullptr, false, &diag_rows);
+}
+
+int Inkling2::debug_tensor_unit_check() {
+  if (!use_tensor_) return 0;
+  Gpu& g = Gpu::get();
+  const uint32_t T = 96, H = uint32_t(cfg_.hidden);
+  int fails = 0;
+  auto cmp = [&](const char* label, const float* got, const float* ref, size_t n, float tol_rel) {
+    double max_abs = 0.0, sum_sq = 0.0, ref_sq = 0.0;
+    size_t max_i = 0;
+    for (size_t i = 0; i < n; ++i) {
+      const double d = double(got[i]) - double(ref[i]);
+      if (std::abs(d) > max_abs) { max_abs = std::abs(d); max_i = i; }
+      sum_sq += d * d;
+      ref_sq += double(ref[i]) * double(ref[i]);
+    }
+    const double rmse = std::sqrt(sum_sq / double(n)), rel = std::sqrt(sum_sq / std::max(1e-12, ref_sq));
+    const bool ok = std::isfinite(rel) && rel <= tol_rel;
+    printf("  UNIT %-20s max_diff=%.6f (at %zu: %.5f vs ref %.5f) rmse=%.6f rel=%.6f -> %s\n",
+           label, max_abs, max_i, got[max_i], ref[max_i], rmse, rel, ok ? "PASS" : "FAIL");
+    return ok ? 0 : 1;
+  };
+  // 1. BF16 GEMM (L0.wq_du)
+  {
+    const Tensor& w = *layers_[0].wq_du;
+    const uint32_t N = uint32_t(w.shape[0]), K = uint32_t(w.shape[1]);
+    for (uint32_t i = 0; i < T * K; ++i) x_mlp_.as<float>()[i] = 0.25f * std::sin(float(i) * 0.013f);
+    std::vector<float> ref(size_t(T) * N), ten(size_t(T) * N);
+    const Ink2MmP mp{T, N, K, K, N, w.dtype == DType::F32 ? 1u : 0u, 0u};
+    for (int arm = 0; arm < 2; ++arm) {
+      auto e = g.begin();
+      e->use(arm ? ink2_tpipe("ink2_bf16_mm_t") : ink2_pipe("ink2_bf16_mm"));
+      e->buf(0, x_mlp_); e->buf(1, w.buf); e->buf(2, q_); e->val(3, mp);
+      e->dispatch((N + 63) / 64, (T + (arm ? 63u : 31u)) / (arm ? 64u : 32u), 1, 128);
+      e->commit_and_wait();
+      (arm ? ten : ref).assign(q_.as<float>(), q_.as<float>() + size_t(T) * N);
+    }
+    fails += cmp("bf16_mm_t", ten.data(), ref.data(), size_t(T) * N, 0.05f);
+  }
+  // 2 & 3. MoE NVFP4 (L0) and MXFP8 (L20)
+  for (uint32_t i = 0; i < T * H; ++i) x_mlp_.as<float>()[i] = 0.25f * std::sin(float(i) * 0.017f);
+  {
+    const Ink2Layer& L0 = layers_[0];
+    auto e = g.begin();
+    e->use(ink2_pipe("ink2_bf16_mm"));
+    e->buf(0, x_mlp_); e->buf(1, L0.router_w->buf); e->buf(2, rlog_);
+    e->val(3, Ink2MmP{T, uint32_t(cfg_.n_experts), H, H, uint32_t(cfg_.n_experts),
+                      L0.router_w->dtype == DType::F32 ? 1u : 0u, 0u});
+    e->dispatch((uint32_t(cfg_.n_experts) + 63) / 64, (T + 31) / 32, 1, 128);
+    e->use(ink2_pipe("ink2_moe_route"));
+    e->buf(0, rlog_); e->buf(1, L0.router_bias->buf); e->buf(2, eid_); e->buf(3, ew_);
+    e->val(4, Ink2RouteP{T, uint32_t(cfg_.n_experts), uint32_t(cfg_.top_k),
+                         L0.router_bias->dtype == DType::F32 ? 1u : 0u, cfg_.route_scale});
+    e->dispatch(T, 1, 1, 32);
+    e->commit_and_wait();
+  }
+  auto check_moe = [&](const char* label, const Ink2Layer& L) {
+    const Ink2MoeP mp{T, H, uint32_t(cfg_.moe_I), uint32_t(cfg_.top_k)};
+    std::vector<float> ref(T * H), ten(T * H);
+    {
+      auto e = g.begin();
+      int b = 0;
+      e->use(ink2_pipe(L.is_mxfp8 ? "ink2_moe_mxfp8_w13_situ" : "ink2_moe_nvfp4_w13_situ"));
+      e->buf(b++, x_mlp_); e->buf(b++, eid_); e->buf(b++, L.w13->buf); e->buf(b++, L.w13_sc->buf);
+      if (!L.is_mxfp8) e->buf(b++, L.w13_outer);
+      e->buf(b++, moe_act_); e->val(b, mp);
+      e->dispatch(L.is_mxfp8 ? (uint32_t(cfg_.moe_I) + 3) / 4 : (uint32_t(cfg_.moe_I) + 15) / 16, uint32_t(cfg_.top_k), T, 128);
+      b = 0;
+      e->use(ink2_pipe(L.is_mxfp8 ? "ink2_moe_mxfp8_w2_acc" : "ink2_moe_nvfp4_w2_acc"));
+      e->buf(b++, moe_act_); e->buf(b++, eid_); e->buf(b++, ew_); e->buf(b++, L.w2->buf); e->buf(b++, L.w2_sc->buf);
+      if (!L.is_mxfp8) e->buf(b++, L.w2_outer);
+      e->buf(b++, moe_out_); e->val(b, mp);
+      e->dispatch((H + (L.is_mxfp8 ? 3u : 15u)) / (L.is_mxfp8 ? 4u : 16u), T, 1, 128);
+      e->commit_and_wait();
+      ref.assign(moe_out_.as<float>(), moe_out_.as<float>() + T * H);
+    }
+    {
+      auto e = g.begin();
+      const struct { uint32_t T, K_top, E; } bp{T, uint32_t(cfg_.top_k), uint32_t(cfg_.n_experts)};
+      e->use(ink2_tpipe("ink2_moe_bucket"));
+      e->buf(0, eid_); e->buf(1, ew_); e->buf(2, moe_tiles_); e->buf(3, moe_ntiles_);
+      e->buf(4, moe_st_tok_); e->buf(5, moe_st_pair_); e->buf(6, moe_st_ew_); e->val(7, bp);
+      e->dispatch(1, 1, 1, 128);
+      const uint32_t max_tiles = (T * uint32_t(cfg_.top_k) + 31u) / 32u + uint32_t(cfg_.n_experts);
+      int b = 0;
+      e->use(ink2_tpipe(L.is_mxfp8 ? "ink2_moe_mxfp8_w13_t" : "ink2_moe_nvfp4_w13_t"));
+      e->buf(b++, x_mlp_); e->buf(b++, L.w13->buf); e->buf(b++, L.w13_sc->buf);
+      if (!L.is_mxfp8) e->buf(b++, L.w13_outer);
+      e->buf(b++, moe_tiles_); e->buf(b++, moe_ntiles_); e->buf(b++, moe_st_tok_); e->buf(b++, moe_act_); e->val(b, mp);
+      e->dispatch((uint32_t(cfg_.moe_I) + 31) / 32, max_tiles, 1, 128);
+      b = 0;
+      e->use(ink2_tpipe(L.is_mxfp8 ? "ink2_moe_mxfp8_w2_t" : "ink2_moe_nvfp4_w2_t"));
+      e->buf(b++, moe_act_); e->buf(b++, L.w2->buf); e->buf(b++, L.w2_sc->buf);
+      if (!L.is_mxfp8) e->buf(b++, L.w2_outer);
+      e->buf(b++, moe_tiles_); e->buf(b++, moe_ntiles_); e->buf(b++, moe_st_pair_);
+      e->buf(b++, moe_st_ew_); e->buf(b++, moe_pair_out_); e->val(b, mp);
+      e->dispatch((H + 63) / 64, max_tiles, 1, 128);
+      e->use(ink2_tpipe("ink2_moe_reduce8"));
+      e->buf(0, moe_pair_out_); e->buf(1, moe_out_); e->val(2, mp);
+      e->dispatch(((H / 4) + 63) / 64, T, 1, 64);
+      e->commit_and_wait();
+      ten.assign(moe_out_.as<float>(), moe_out_.as<float>() + T * H);
+    }
+    return cmp(label, ten.data(), ref.data(), T * H, 0.2f);
+  };
+  fails += check_moe("moe_nvfp4_t", layers_[0]);
+  fails += check_moe("moe_mxfp8_t", layers_[20]);
+  // 4. Attention Prefill (T=96, SWA)
+  {
+    auto seq = new_seq(512, 512);
+    const uint32_t QD = uint32_t(cfg_.hq) * uint32_t(cfg_.head_dim), KVD = uint32_t(cfg_.hkv) * uint32_t(cfg_.head_dim);
+    for (uint32_t i = 0; i < T * QD; ++i) {
+      q_.as<float>()[i] = 0.2f * std::sin(float(i) * 0.017f);
+      gate_attn_.as<float>()[i] = 0.5f * std::cos(float(i) * 0.011f);
+    }
+    for (uint32_t i = 0; i < T * uint32_t(cfg_.hq); ++i) sinks_.as<float>()[i] = 0.1f * std::sin(float(i) * 0.1f);
+    for (uint32_t i = 0; i < T * uint32_t(cfg_.hq) * uint32_t(cfg_.rel_extent); ++i)
+      rb_.as<float>()[i] = 0.05f * std::sin(float(i) * 0.007f);
+    for (uint32_t i = 0; i < T * KVD; ++i) {
+      __fp16 kv = __fp16(0.2f * std::cos(float(i) * 0.019f)), vv = __fp16(0.2f * std::sin(float(i) * 0.023f));
+      std::memcpy(seq->kc[0].as<uint16_t>() + i, &kv, 2);
+      std::memcpy(seq->vc[0].as<uint16_t>() + i, &vv, 2);
+    }
+    const Ink2AttnPfP apf{T, 0u, uint32_t(ring_rows_), uint32_t(cfg_.hq), uint32_t(cfg_.hkv), uint32_t(cfg_.head_dim),
+                          uint32_t(cfg_.rel_extent), 1u, uint32_t(cfg_.swa), 1.0f / std::sqrt(float(cfg_.head_dim))};
+    std::vector<float> ref(T * QD), ten(T * QD);
+    for (int arm = 0; arm < 2; ++arm) {
+      auto e = g.begin();
+      e->use(arm ? ink2_tpipe("ink2_attn_prefill_t") : ink2_pipe("ink2_attn_prefill"));
+      e->buf(0, q_); e->buf(1, seq->kc[0]); e->buf(2, seq->vc[0]); e->buf(3, rb_);
+      e->buf(4, sinks_); e->buf(5, gate_attn_); e->buf(6, att_out_); e->val(7, apf);
+      e->dispatch(arm ? (T + 15) / 16 : uint32_t(cfg_.hq), arm ? uint32_t(cfg_.hq) : T, 1, 128);
+      e->commit_and_wait();
+      (arm ? ten : ref).assign(att_out_.as<float>(), att_out_.as<float>() + T * QD);
+    }
+    fails += cmp("attn_prefill_t", ten.data(), ref.data(), T * QD, 0.2f);
+  }
+  // 5. Batched Cross-Pass MessageGate
+  {
+    const Ink2Ctrl& c = layers_[size_t(cfg_.core_start)].ctrl_attn;
+    for (uint32_t i = 0; i < T * H; ++i) {
+      x_mlp_.as<float>()[i] = 0.25f * std::sin(float(i) * 0.013f);
+      h_mlp_.as<float>()[i] = 0.25f * std::cos(float(i) * 0.017f);
+    }
+    const Ink2MsgGateP mgp{T, H, uint32_t(cfg_.gate_rank), c.down->dtype == DType::F32 ? 1u : 0u, cfg_.rms_eps};
+    std::vector<float> ref(T * H), ten(T * H);
+    {
+      auto e = g.begin();
+      e->use(ink2_pipe("ink2_msg_gate"));
+      e->buf(0, x_mlp_); e->buf(1, h_mlp_); e->buf(2, c.down->buf); e->buf(3, c.forget->buf);
+      e->buf(4, c.gain->buf); e->buf(5, n0_); e->val(6, mgp); e->dispatch(T, 1, 1, 512);
+      e->commit_and_wait();
+      ref.assign(n0_.as<float>(), n0_.as<float>() + T * H);
+    }
+    {
+      auto e = g.begin();
+      enc_msg_gate(*e, c, x_mlp_, h_mlp_, n1_, int(T));
+      e->commit_and_wait();
+      ten.assign(n1_.as<float>(), n1_.as<float>() + T * H);
+    }
+    fails += cmp("msg_gate_t", ten.data(), ref.data(), T * H, 0.05f);
+  }
+  return fails;
 }
 
 }  // namespace ni
