@@ -117,6 +117,38 @@ struct Ink2MtpFoldP {
 struct Ink2MtpArgmaxP {
   uint32_t V;
 };
+struct Ink2MtpAccP {
+  uint32_t R, K, V, K_top, point_mass, seed, step, pos, lists, chunk;
+  float inv_t, top_p;
+};
+struct Ink2CandNode {
+  int32_t tok, parent_pool;
+  uint32_t depth;
+  float path_logp;
+};
+struct Ink2BeamState {
+  uint32_t n_beam, pool_count;
+  int32_t tok[4];
+  uint32_t pool_idx[4];
+  float logp[4];
+};
+struct Ink2MtpBeamPrepP {
+  uint32_t rank, H, first_step;
+};
+struct Ink2MtpBeamUpdP {
+  uint32_t rank, first_step;
+};
+struct Ink2MtpBeamStepP {
+  uint32_t V, R, d, R_budget, last_step;
+  float inv_t;
+};
+struct Ink2MtpTreeSelP {
+  uint32_t R_budget, pos;
+};
+struct Ink2MtpTreeAccP {
+  uint32_t V, seed, step, pos;
+  float inv_t;
+};
 
 const json* find_mtp_json(const json& root) {
   if (root.contains("mtp_config") && root["mtp_config"].is_object()) return &root["mtp_config"];
@@ -177,6 +209,34 @@ struct SparseDist {
 
 SparseDist compute_row_dist(const float* logits, uint32_t V, const SamplingParams& sp) {
   SparseDist d;
+  if (sp.top_k <= 0 && sp.top_p >= 1.0f) {
+    float max_v = -INFINITY;
+    for (uint32_t i = 0; i < V; ++i) {
+      const float lv = std::isnan(logits[i]) ? -INFINITY : logits[i];
+      if (lv > max_v) max_v = lv;
+    }
+    if (!(max_v > -INFINITY)) {
+      d.items.emplace_back(0u, 1.0f);
+      return d;
+    }
+    d.items.reserve(V);
+    double kt = 0.0;
+    const double inv_t = 1.0 / double(sp.temperature);
+    for (uint32_t i = 0; i < V; ++i) {
+      const float lv = std::isnan(logits[i]) ? -INFINITY : logits[i];
+      if (!(lv > -INFINITY)) continue;
+      const float w = std::exp(float(double(lv - max_v) * inv_t));
+      d.items.emplace_back(i, w);
+      kt += double(w);
+    }
+    if (d.items.empty()) {
+      d.items.emplace_back(0u, 1.0f);
+      return d;
+    }
+    const float inv = kt > 0.0 ? float(1.0 / kt) : 1.0f;
+    for (auto& kv : d.items) kv.second *= inv;
+    return d;
+  }
   const uint32_t Kc = (!full_vocab(sp)) ? topk_k(sp)
                                         : (sp.top_k > 0 && uint32_t(sp.top_k) < V ? uint32_t(sp.top_k) : V);
   struct Cand {
@@ -260,7 +320,7 @@ SparseDist compute_row_dist(const float* logits, uint32_t V, const SamplingParam
 }  // namespace
 
 int ink2_mtp_accept_cpu(int* tokens, int P, int K, int V, const float* verify_logits, const float* draft_logits,
-                        const int* verify_samples, const SamplingParams& sp, uint32_t step) {
+                        const int* verify_samples, const SamplingParams& sp, uint32_t step, bool point_mass) {
   if (sp.temperature <= 0.0f) {
     int a = 0;
     while (a < K && tokens[P + 1 + a] == verify_samples[a]) ++a;
@@ -269,16 +329,67 @@ int ink2_mtp_accept_cpu(int* tokens, int P, int K, int V, const float* verify_lo
   }
 
   const uint32_t Vu = uint32_t(V);
+  thread_local std::vector<float> q_dense;
+  if (!point_mass && q_dense.size() < Vu) q_dense.assign(Vu, 0.0f);
+
   int a = 0;
   for (; a < K; ++a) {
     const uint32_t dt = uint32_t(tokens[P + 1 + a]);
     const SparseDist p = compute_row_dist(verify_logits + size_t(a) * Vu, Vu, sp);
-    const SparseDist q = compute_row_dist(draft_logits + size_t(a) * Vu, Vu, sp);
     const float pa = p.prob(dt);
-    const float qa = q.prob(dt);
     const float u_acc =
         float(pcg_hash(sp.seed ^ pcg_hash(step + uint32_t(a)) ^ 0x9e3779b9u) & 0xffffffu) / 16777216.0f;
-    if (qa > 0.0f && u_acc * qa < pa) continue;
+
+    if (point_mass) {
+      if (u_acc < pa) continue;
+      std::vector<std::pair<uint32_t, float>> res;
+      res.reserve(p.items.size());
+      double rsum = 0.0;
+      for (const auto& kv : p.items) {
+        if (kv.first == dt) continue;
+        if (kv.second > 0.0f) {
+          res.emplace_back(kv.first, kv.second);
+          rsum += double(kv.second);
+        }
+      }
+      uint32_t chosen = p.items.empty() ? 0u : p.items[0].first;
+      const float u_res =
+          float(pcg_hash(sp.seed ^ pcg_hash(step + uint32_t(a)) ^ 0x517cc1b7u) & 0xffffffu) / 16777216.0f;
+      if (rsum > 0.0 && !res.empty()) {
+        const double target = double(u_res) * rsum;
+        double acc = 0.0;
+        chosen = res.back().first;
+        for (const auto& kv : res) {
+          acc += double(kv.second);
+          if (target < acc) {
+            chosen = kv.first;
+            break;
+          }
+        }
+      } else if (!p.items.empty()) {
+        double acc = 0.0;
+        chosen = p.items.back().first;
+        for (const auto& kv : p.items) {
+          acc += double(kv.second);
+          if (double(u_res) < acc) {
+            chosen = kv.first;
+            break;
+          }
+        }
+      }
+      tokens[P + 1 + a] = int(chosen);
+      return a;
+    }
+
+    const SparseDist q = compute_row_dist(draft_logits + size_t(a) * Vu, Vu, sp);
+    for (const auto& kv : q.items)
+      if (kv.first < Vu) q_dense[kv.first] = kv.second;
+    const float qa = (dt < Vu) ? q_dense[dt] : 0.0f;
+    if (qa > 0.0f && u_acc * qa < pa) {
+      for (const auto& kv : q.items)
+        if (kv.first < Vu) q_dense[kv.first] = 0.0f;
+      continue;
+    }
 
     // Rejected: draw correction token from residual max(0, p(x) - q(x)) with independent salt distinct from
     // both the draft sampler's uniform hash and u_acc.
@@ -286,12 +397,15 @@ int ink2_mtp_accept_cpu(int* tokens, int P, int K, int V, const float* verify_lo
     res.reserve(p.items.size());
     double rsum = 0.0;
     for (const auto& kv : p.items) {
-      const float r = kv.second - q.prob(kv.first);
+      const float qv = (kv.first < Vu) ? q_dense[kv.first] : 0.0f;
+      const float r = kv.second - qv;
       if (r > 0.0f) {
         res.emplace_back(kv.first, r);
         rsum += double(r);
       }
     }
+    for (const auto& kv : q.items)
+      if (kv.first < Vu) q_dense[kv.first] = 0.0f;
     uint32_t chosen = p.items.empty() ? 0u : p.items[0].first;
     const float u_res =
         float(pcg_hash(sp.seed ^ pcg_hash(step + uint32_t(a)) ^ 0x517cc1b7u) & 0xffffffu) / 16777216.0f;
@@ -322,6 +436,124 @@ int ink2_mtp_accept_cpu(int* tokens, int P, int K, int V, const float* verify_lo
   }
   tokens[P + 1 + K] = verify_samples[K];
   return K;
+}
+
+Ink2TreeAccept ink2_mtp_accept_tree_cpu(int* tokens, int P, const Ink2Tree& tree, int V,
+                                        const float* verify_logits, const int* verify_samples,
+                                        const SamplingParams& sp, uint32_t step) {
+  Ink2TreeAccept out{};
+  const uint32_t R_lim = std::min<uint32_t>(tree.R, 16u);
+  if (sp.temperature <= 0.0f) {
+    int m = 1;
+    uint32_t u = 0u;
+    out.path[0] = 0;
+    while (uint32_t(m) < R_lim) {
+      const int target = verify_samples[u];
+      const uint32_t nc = std::min<uint32_t>(tree.n_child[u], 15u);
+      int next_u = -1;
+      for (uint32_t j = 0u; j < nc; ++j) {
+        const uint32_t c = tree.child[u][j];
+        if (c < R_lim && tree.tokens[c] == target) {
+          next_u = int(c);
+          break;
+        }
+      }
+      if (next_u < 0) break;
+      tokens[P + m] = target;
+      out.path[m] = next_u;
+      u = uint32_t(next_u);
+      ++m;
+    }
+    const int bonus = verify_samples[u];
+    tokens[P + m] = bonus;
+    out.m = m;
+    out.stop_node = int(u);
+    out.bonus_tok = bonus;
+    out.ok = 1;
+    return out;
+  }
+
+  const uint32_t Vu = uint32_t(V);
+  int m = 1;
+  uint32_t u = 0u;
+  out.path[0] = 0;
+  SparseDist p;
+  while (true) {
+    p = compute_row_dist(verify_logits + size_t(u) * Vu, Vu, sp);
+    const uint32_t nc = std::min<uint32_t>(tree.n_child[u], 15u);
+    if (uint32_t(m) >= R_lim || nc == 0u) break;
+    const float u_acc =
+        float(pcg_hash(sp.seed ^ pcg_hash(step + u) ^ 0x9e3779b9u) & 0xffffffu) / 16777216.0f;
+    double cum = 0.0;
+    int next_u = -1;
+    int next_tok = 0;
+    for (uint32_t k = 0u; k < nc; ++k) {
+      const uint32_t c = tree.child[u][k];
+      if (c >= R_lim) continue;
+      const int ctok = tree.tokens[c];
+      cum += double(p.prob(uint32_t(ctok)));
+      if (double(u_acc) < cum) {
+        next_u = int(c);
+        next_tok = ctok;
+        break;
+      }
+    }
+    if (next_u < 0) break;
+    tokens[P + m] = next_tok;
+    out.path[m] = next_u;
+    u = uint32_t(next_u);
+    ++m;
+  }
+
+  const uint32_t nc = std::min<uint32_t>(tree.n_child[u], 15u);
+  std::vector<std::pair<uint32_t, float>> res;
+  res.reserve(p.items.size());
+  double rsum = 0.0;
+  for (const auto& kv : p.items) {
+    bool rej = false;
+    for (uint32_t k = 0u; k < nc; ++k) {
+      const uint32_t c = tree.child[u][k];
+      if (c < R_lim && uint32_t(tree.tokens[c]) == kv.first) {
+        rej = true;
+        break;
+      }
+    }
+    if (!rej && kv.second > 0.0f) {
+      res.emplace_back(kv.first, kv.second);
+      rsum += double(kv.second);
+    }
+  }
+  const float u_res =
+      float(pcg_hash(sp.seed ^ pcg_hash(step + u) ^ 0x517cc1b7u) & 0xffffffu) / 16777216.0f;
+  uint32_t chosen = p.items.empty() ? 0u : p.items[0].first;
+  if (rsum > 0.0 && !res.empty()) {
+    const double target = double(u_res) * rsum;
+    double acc = 0.0;
+    chosen = res.back().first;
+    for (const auto& kv : res) {
+      acc += double(kv.second);
+      if (target < acc) {
+        chosen = kv.first;
+        break;
+      }
+    }
+  } else if (!p.items.empty()) {
+    double acc = 0.0;
+    chosen = p.items.back().first;
+    for (const auto& kv : p.items) {
+      acc += double(kv.second);
+      if (double(u_res) < acc) {
+        chosen = kv.first;
+        break;
+      }
+    }
+  }
+  tokens[P + m] = int(chosen);
+  out.m = m;
+  out.stop_node = int(u);
+  out.bonus_tok = int(chosen);
+  out.ok = 1;
+  return out;
 }
 
 bool Ink2Mtp::exists(const std::string& dir) {
@@ -647,11 +879,46 @@ Ink2Mtp::Ink2Mtp(Inkling2& trunk, const std::string& dir, const Ink2Config& trun
   d_cand_v_ = alloc((V / 2048 + 2) * 64 * 4, "ink2_mtp_cand_v");
   d_cand_i_ = alloc((V / 2048 + 2) * 64 * 4, "ink2_mtp_cand_i");
   d_sprob_ = alloc(64 * 4, "ink2_mtp_sprob");
+  acc_stats_ = alloc(size_t(kMaxVerifyRows) * 8u, "ink2_mtp_acc_stats");
+  acc_cand_v_ = alloc(size_t(kMaxVerifyRows) * 4096u * 4u, "ink2_mtp_acc_cv");
+  acc_cand_i_ = alloc(size_t(kMaxVerifyRows) * 4096u * 4u, "ink2_mtp_acc_ci");
+  acc_dists_ = alloc(size_t(kMaxVerifyRows) * (4u + 64u * 4u + 64u * 4u), "ink2_mtp_acc_dists");
+
+  beam_state_ = alloc(4u * R * 4u, "ink2_mtp_b_state");
+  beam_next_state_ = alloc(4u * R * 4u, "ink2_mtp_b_nstate");
+  beam_latent_ = alloc(4u * R * 4u, "ink2_mtp_b_lat");
+  beam_rnn_in_ = alloc(4u * (2u * R + 2u * H) * 4u, "ink2_mtp_b_rin");
+  beam_rnn_gates_ = alloc(4u * 3u * R * 4u, "ink2_mtp_b_rg");
+  beam_cand_v_ = alloc(4u * 128u * 4u, "ink2_mtp_b_cv");
+  beam_cand_i_ = alloc(4u * 128u * 4u, "ink2_mtp_b_ci");
+  beam_meta_ = alloc(sizeof(Ink2BeamState), "ink2_mtp_b_meta");
+  cand_pool_ = alloc(128u * sizeof(Ink2CandNode), "ink2_mtp_cpool");
+  tree_buf_ = alloc(sizeof(Ink2Tree), "ink2_mtp_tree");
 
   g.make_resident(ws_.buffers());
   g.make_resident(owned_bufs_);
   (void)mtp_pipe("ink2_mtp_attn_splitk");
+  (void)mtp_pipe("ink2_mtp_attn_splitk_gqa");
   (void)mtp_pipe("ink2_mtp_attn_reduce");
+  (void)mtp_pipe("ink2_mtp_row_logz");
+  (void)mtp_pipe("ink2_mtp_accept_full_decide");
+  (void)mtp_pipe("ink2_mtp_sample_emit_stage1");
+  (void)mtp_pipe("ink2_mtp_sample_emit_stage2");
+  (void)mtp_pipe("ink2_mtp_topk_stage1_rows");
+  (void)mtp_pipe("ink2_mtp_topk_stage2_dists");
+  (void)mtp_pipe("ink2_mtp_accept_topk_decide");
+  (void)mtp_pipe("ink2_mtp_beam_init");
+  (void)mtp_pipe("ink2_mtp_beam_rnn_prep");
+  (void)mtp_pipe("ink2_mtp_beam_rnn_update");
+  (void)mtp_pipe("ink2_mtp_p2_fold_screen_beam");
+  (void)mtp_pipe("ink2_mtp_rescore_beam");
+  (void)mtp_pipe("ink2_mtp_beam_step");
+  (void)mtp_pipe("ink2_mtp_tree_select");
+  (void)mtp_pipe("ink2_mtp_accept_tree_greedy");
+  (void)mtp_pipe("ink2_mtp_accept_tree_full_decide");
+  (void)mtp_pipe("ink2_mtp_sample_emit_tree_stage1");
+  (void)mtp_pipe("ink2_mtp_sample_emit_tree_stage2");
+  (void)mtp_pipe("ink2_mtp_accept_tree_topk_decide");
   logi("Ink2Mtp loaded: 3 layers (block=%d, markov_rank=%d, taps=[%d,%d,%d,%d], w=%s, screen=%s), %.2f GB + %.0f MB folded in %.0f ms",
        cfg_.block, cfg_.markov_rank, cfg_.taps[0], cfg_.taps[1], cfg_.taps[2], cfg_.taps[3],
        w_mode_ == WeightMode::Q4 ? "q4" : (w_mode_ == WeightMode::Q8 ? "q8" : "bf16"),
@@ -719,18 +986,19 @@ void Ink2Mtp::enc_mv_q(Encoder& e, const Buffer& wq, const Buffer& ws, uint32_t 
     e.buf(2, ws);
     e.buf(3, y.view(size_t(m0) * N * 4, size_t(mc) * N * 4));
     e.val(4, p);
-    e.dispatch((N + 15u) / 16u, 1, 1, 128);
+    e.dispatch((N + 7u) / 8u, 1, 1, 128);
   }
 }
 
 void Ink2Mtp::enc_rmsnorm(Encoder& e, const Buffer& x, const Tensor& w, const Buffer& out, int T) const {
   const Ink2MtpNormP p{uint32_t(T), uint32_t(cfg_.hidden), cfg_.rms_eps};
-  e.use(mtp_pipe("ink2_mtp_rmsnorm"));
+  const Pipeline pl = mtp_pipe("ink2_mtp_rmsnorm");
+  e.use(pl);
   e.buf(0, x);
   e.buf(1, w.buf);
   e.buf(2, out);
   e.val(3, p);
-  e.dispatch(uint32_t(T), 1, 1, 512);
+  e.dispatch(uint32_t(T), 1, 1, std::min(512u, pl.max_threads));
 }
 
 void Ink2Mtp::encode_commit_context(Encoder& e, Seq& s, int pos0, int T, const Buffer& tap0, const Buffer& tap1,
@@ -738,11 +1006,13 @@ void Ink2Mtp::encode_commit_context(Encoder& e, Seq& s, int pos0, int T, const B
   if (T <= 0) return;
   const uint32_t H = uint32_t(cfg_.hidden);
   const size_t nv = trunk_.cfg_.schedule.size();
+  const Pipeline fuse_pl = mtp_pipe("ink2_mtp_fuse_norm");
+  const uint32_t fuse_ntg = std::min(512u, fuse_pl.max_threads);
 
   for (int i = 0; i < cfg_.num_layers; ++i) {
     const Ink2MtpLayer& L = layers_[size_t(i)];
     const Ink2MtpFuseP fp{uint32_t(T), H, fuse_w_[i][0], fuse_w_[i][1], fuse_w_[i][2], fuse_w_[i][3], cfg_.rms_eps};
-    e.use(mtp_pipe("ink2_mtp_fuse_norm"));
+    e.use(fuse_pl);
     e.buf(0, tap0);
     e.buf(1, tap1);
     e.buf(2, tap2);
@@ -750,7 +1020,7 @@ void Ink2Mtp::encode_commit_context(Encoder& e, Seq& s, int pos0, int T, const B
     e.buf(4, L.ctx_norm->buf);
     e.buf(5, ctx_h_);
     e.val(6, fp);
-    e.dispatch(uint32_t(T), 1, 1, 512);
+    e.dispatch(uint32_t(T), 1, 1, fuse_ntg);
 
     e.group_begin();
     enc_mv(e, *L.k_proj_ctx, ctx_h_, ctx_k_, T);
@@ -784,7 +1054,7 @@ void Ink2Mtp::encode_commit_context(Encoder& e, Seq& s, int pos0, int T, const B
   const size_t last_off = size_t(T - 1) * H * 4;
   const size_t row_bytes = size_t(H) * 4;
   const Ink2MtpFuseP rp{1u, H, fuse_w_[3][0], fuse_w_[3][1], fuse_w_[3][2], fuse_w_[3][3], cfg_.rms_eps};
-  e.use(mtp_pipe("ink2_mtp_fuse_norm"));
+  e.use(fuse_pl);
   e.buf(0, tap0.view(last_off, row_bytes));
   e.buf(1, tap1.view(last_off, row_bytes));
   e.buf(2, tap2.view(last_off, row_bytes));
@@ -792,28 +1062,26 @@ void Ink2Mtp::encode_commit_context(Encoder& e, Seq& s, int pos0, int T, const B
   e.buf(4, rec_norm_->buf);
   e.buf(5, s.conv[1]);
   e.val(6, rp);
-  e.dispatch(1, 1, 1, 512);
+  e.dispatch(1, 1, 1, fuse_ntg);
 }
 
-void Ink2Mtp::encode_draft(Encoder& e, Seq& s, int P, int K, const SamplingParams& sp, uint32_t step) {
+void Ink2Mtp::encode_block_backbone(Encoder& e, Seq& s, int P) {
   const int B = cfg_.block;
-  const int Kd = std::clamp(K, 1, B - 1);
   const uint32_t H = uint32_t(cfg_.hidden);
   const uint32_t QD = uint32_t(cfg_.hq * cfg_.head_dim);
-  const uint32_t R = uint32_t(cfg_.markov_rank);
-  const uint32_t V = uint32_t(vocab_);
   const size_t nv = trunk_.cfg_.schedule.size();
 
   {
     const Ink2MtpPrepP pp{uint32_t(B), H, uint32_t(P), cfg_.rms_eps};
-    e.use(mtp_pipe("ink2_mtp_prep_block"));
+    const Pipeline prep_pl = mtp_pipe("ink2_mtp_prep_block");
+    e.use(prep_pl);
     e.buf(0, s.tok);
     e.buf(1, embed_->buf);
     e.buf(2, embed_norm_->buf);
     e.buf(3, mask_embed_->buf);
     e.buf(4, blk_x_);
     e.val(5, pp);
-    e.dispatch(uint32_t(B), 1, 1, 512);
+    e.dispatch(uint32_t(B), 1, 1, std::min(512u, prep_pl.max_threads));
   }
 
   const float attn_scale = 1.0f / std::sqrt(float(cfg_.head_dim));
@@ -834,7 +1102,7 @@ void Ink2Mtp::encode_draft(Encoder& e, Seq& s, int P, int K, const SamplingParam
       e.buf(4, blk_k_);
       e.buf(5, blk_v_);
       e.val(6, mp);
-      e.dispatch((mp.N_tot + 15) / 16, 1, 1, 128);
+      e.dispatch((mp.N_tot + 7u) / 8u, 1, 1, 128);
     } else if (L.qkv_w) {
       const Ink2MtpMulti3P mp{uint32_t(B), H, L.qkv_offs[3],
                               {L.qkv_offs[0], L.qkv_offs[1], L.qkv_offs[2], L.qkv_offs[3]}};
@@ -898,9 +1166,10 @@ void Ink2Mtp::encode_draft(Encoder& e, Seq& s, int P, int K, const SamplingParam
       e.dispatch(uint32_t(cfg_.hq + cfg_.hkv), uint32_t(B), 1, uint32_t(cfg_.head_dim));
     }
 
-    if (!L.is_local && P >= 256 && B <= 8) {
-      const uint32_t lk = uint32_t(P);
-      uint32_t chunk = std::max(64u, (lk + 63u) / 64u);
+    const uint32_t lk = L.is_local ? std::min(uint32_t(P), uint32_t(cfg_.swa)) : uint32_t(P);
+    if (lk >= 128u && B <= 8) {
+      const bool use_gqa = (cfg_.hq == cfg_.hkv * 3 && cfg_.head_dim == 128);
+      uint32_t chunk = std::max(use_gqa ? 16u : 64u, (lk + 63u) / 64u);
       chunk = (chunk + 3u) / 4u * 4u;
       const uint32_t nchunks = std::max(1u, (lk + chunk - 1u) / chunk);
       const Ink2MtpAttnSplitP ap{uint32_t(B),
@@ -909,22 +1178,36 @@ void Ink2Mtp::encode_draft(Encoder& e, Seq& s, int P, int K, const SamplingParam
                                  uint32_t(cfg_.hq),
                                  uint32_t(cfg_.hkv),
                                  uint32_t(cfg_.head_dim),
-                                 0u,
+                                 L.is_local ? 1u : 0u,
                                  uint32_t(cfg_.swa),
                                  chunk,
                                  nchunks,
                                  attn_scale};
-      e.use(mtp_pipe("ink2_mtp_attn_splitk"));
-      e.buf(0, blk_q_);
-      e.buf(1, s.kc[nv + size_t(i)]);
-      e.buf(2, s.vc[nv + size_t(i)]);
-      e.buf(3, blk_k_);
-      e.buf(4, blk_v_);
-      e.buf(5, part_m_);
-      e.buf(6, part_l_);
-      e.buf(7, part_o_);
-      e.val(8, ap);
-      e.dispatch(uint32_t(cfg_.hq), nchunks, 1, 128);
+      if (use_gqa) {
+        e.use(mtp_pipe("ink2_mtp_attn_splitk_gqa"));
+        e.buf(0, blk_q_);
+        e.buf(1, s.kc[nv + size_t(i)]);
+        e.buf(2, s.vc[nv + size_t(i)]);
+        e.buf(3, blk_k_);
+        e.buf(4, blk_v_);
+        e.buf(5, part_m_);
+        e.buf(6, part_l_);
+        e.buf(7, part_o_);
+        e.val(8, ap);
+        e.dispatch(uint32_t(cfg_.hkv), nchunks, (uint32_t(B) + 3u) / 4u, 192);
+      } else {
+        e.use(mtp_pipe("ink2_mtp_attn_splitk"));
+        e.buf(0, blk_q_);
+        e.buf(1, s.kc[nv + size_t(i)]);
+        e.buf(2, s.vc[nv + size_t(i)]);
+        e.buf(3, blk_k_);
+        e.buf(4, blk_v_);
+        e.buf(5, part_m_);
+        e.buf(6, part_l_);
+        e.buf(7, part_o_);
+        e.val(8, ap);
+        e.dispatch(uint32_t(cfg_.hq), nchunks, 1, 128);
+      }
 
       e.use(mtp_pipe("ink2_mtp_attn_reduce"));
       e.buf(0, part_m_);
@@ -975,7 +1258,7 @@ void Ink2Mtp::encode_draft(Encoder& e, Seq& s, int P, int K, const SamplingParam
       e.buf(2, L.gu_s);
       e.buf(3, blk_gate_);
       e.val(4, mp);
-      e.dispatch((uint32_t(cfg_.ffn) + 7) / 8, 1, 1, 128);
+      e.dispatch((uint32_t(cfg_.ffn) + 3u) / 4u, 1, 1, 128);
     } else if (L.gate_up_w) {
       const Ink2MtpMmP mp{uint32_t(B), uint32_t(cfg_.ffn), H, H, uint32_t(cfg_.ffn), 0u, 0u, 0u, 0.0f};
       if (B >= 5 && B <= 8 && (H & 255u) == 0u) {
@@ -1023,6 +1306,16 @@ void Ink2Mtp::encode_draft(Encoder& e, Seq& s, int P, int K, const SamplingParam
   }
 
   enc_rmsnorm(e, blk_x_, *norm_, blk_norm_, B);
+}
+
+void Ink2Mtp::encode_draft(Encoder& e, Seq& s, int P, int K, const SamplingParams& sp, uint32_t step) {
+  const int B = cfg_.block;
+  const int Kd = std::clamp(K, 1, B - 1);
+  const uint32_t H = uint32_t(cfg_.hidden);
+  const uint32_t R = uint32_t(cfg_.markov_rank);
+  const uint32_t V = uint32_t(vocab_);
+
+  encode_block_backbone(e, s, P);
 
   const bool use_p2 = screen_on_ && sp.temperature <= 0.0f && s.mask_rows == 0;
   if (use_p2) {
@@ -1169,10 +1462,322 @@ void Ink2Mtp::encode_draft(Encoder& e, Seq& s, int P, int K, const SamplingParam
   }
 }
 
+bool Ink2Mtp::can_gpu_accept(const SamplingParams& sp) {
+  if (sp.temperature <= 0.0f) return false;
+  if (sp.top_k <= 0 && sp.top_p >= 1.0f) return true;
+  return sp.top_k >= 1 && sp.top_k <= kTopkMax;
+}
+
+void Ink2Mtp::encode_accept_gpu(Encoder& e, Seq& s, int P, int R, const Buffer& verify_logits, const Buffer& accept_out,
+                                const SamplingParams& sp, uint32_t step, bool point_mass) const {
+  const uint32_t V = uint32_t(vocab_);
+  const uint32_t K = uint32_t(std::max(0, R - 1));
+  const uint32_t n_rows = uint32_t(R) + (point_mass ? 0u : K);
+  const Buffer& dlog = point_mass ? verify_logits : draft_logits_;
+
+  if (sp.top_k <= 0 && sp.top_p >= 1.0f) {
+    const Ink2MtpAccP ap{uint32_t(R), K, V, 0u, point_mass ? 1u : 0u, sp.seed, step, uint32_t(P), 0u, 0u,
+                          1.0f / sp.temperature, sp.top_p};
+    e.use(mtp_pipe("ink2_mtp_row_logz"));
+    e.buf(0, verify_logits);
+    e.buf(1, dlog);
+    e.buf(2, acc_stats_);
+    e.val(3, ap);
+    e.dispatch(n_rows, 1, 1, 512);
+
+    e.use(mtp_pipe("ink2_mtp_accept_full_decide"));
+    e.buf(0, s.tok);
+    e.buf(1, verify_logits);
+    e.buf(2, dlog);
+    e.buf(3, acc_stats_);
+    e.buf(4, accept_out);
+    e.val(5, ap);
+    e.dispatch(1, 1, 1, 32);
+
+    e.use(mtp_pipe("ink2_mtp_sample_emit_stage1"));
+    e.buf(0, s.tok);
+    e.buf(1, verify_logits);
+    e.buf(2, dlog);
+    e.buf(3, acc_stats_);
+    e.buf(4, accept_out);
+    e.buf(5, acc_cand_v_);
+    e.buf(6, acc_cand_i_);
+    e.val(7, ap);
+    e.dispatch(64, 1, 1, 256);
+
+    e.use(mtp_pipe("ink2_mtp_sample_emit_stage2"));
+    e.buf(0, acc_cand_v_);
+    e.buf(1, acc_cand_i_);
+    e.buf(2, accept_out);
+    e.buf(3, s.tok);
+    e.val(4, ap);
+    e.dispatch(1, 1, 1, 64);
+    return;
+  }
+
+  const uint32_t Ktop = uint32_t(std::clamp(sp.top_k, 1, kTopkMax));
+  const uint32_t chunk = topk_chunk(Ktop);
+  const uint32_t lists = topk_lists(V, Ktop);
+  const Ink2MtpAccP ap{uint32_t(R), K, V, Ktop, point_mass ? 1u : 0u, sp.seed, step, uint32_t(P), lists, chunk,
+                        1.0f / sp.temperature, sp.top_p};
+  e.use(mtp_pipe("ink2_mtp_topk_stage1_rows"));
+  e.buf(0, verify_logits);
+  e.buf(1, dlog);
+  e.buf(2, acc_cand_v_);
+  e.buf(3, acc_cand_i_);
+  e.val(4, ap);
+  e.dispatch(lists, n_rows, 1, topk_threads(Ktop));
+
+  e.use(mtp_pipe("ink2_mtp_topk_stage2_dists"));
+  e.buf(0, acc_cand_v_);
+  e.buf(1, acc_cand_i_);
+  e.buf(2, acc_dists_);
+  e.val(3, ap);
+  e.dispatch(n_rows, 1, 1, 1024);
+
+  e.use(mtp_pipe("ink2_mtp_accept_topk_decide"));
+  e.buf(0, acc_dists_);
+  e.buf(1, s.tok);
+  e.buf(2, accept_out);
+  e.val(3, ap);
+  e.dispatch(1, 1, 1, 32);
+}
+
 int Ink2Mtp::accept(Seq& s, int P, int K, const Buffer& verify_logits, const Buffer& verify_samples,
-                    const SamplingParams& sp, uint32_t step) const {
+                    const Buffer& accept_out, const SamplingParams& sp, uint32_t step, bool point_mass,
+                    bool gpu_accepted) const {
+  if (gpu_accepted && accept_out && accept_out.as<int>()[2] == 1) {
+    return accept_out.as<int>()[0];
+  }
   return ink2_mtp_accept_cpu(s.tokens(), P, K, vocab_, verify_logits.as<float>(), draft_logits_.as<float>(),
-                             verify_samples.as<int>(), sp, step);
+                             verify_samples.as<int>(), sp, step, point_mass);
+}
+
+void Ink2Mtp::encode_draft_tree(Encoder& e, Seq& s, int P, int R_budget, const SamplingParams& sp) {
+  if (!can_tree()) fatal("ink2_mtp: beam tree drafting requires p2 screening and markov_rank=256");
+  const int B = cfg_.block;
+  const int R_b = std::clamp(R_budget, 2, kMaxVerifyRows);
+  const int D_max = std::min(B - 1, R_b - 1);
+  const uint32_t H = uint32_t(cfg_.hidden);
+  const uint32_t R = uint32_t(cfg_.markov_rank);
+  const uint32_t V = uint32_t(vocab_);
+
+  encode_block_backbone(e, s, P);
+
+  {
+    const Ink2MtpP2BaseP bp{uint32_t(D_max), V, H, H / 32u};
+    e.use(mtp_pipe("ink2_mtp_p2_unembed_base"));
+    e.buf(0, blk_norm_.view(size_t(H) * 4, size_t(D_max) * H * 4));
+    e.buf(1, unembed_p2_q_);
+    e.buf(2, unembed_p2_s_);
+    e.buf(3, fold_b_);
+    e.buf(4, base_proxy_);
+    e.val(5, bp);
+    e.dispatch((V + 15u) / 16u, 1, 1, 128);
+  }
+
+  {
+    const uint32_t pos_u = uint32_t(P);
+    e.use(mtp_pipe("ink2_mtp_beam_init"));
+    e.buf(0, s.tok);
+    e.buf(1, beam_meta_);
+    e.buf(2, cand_pool_);
+    e.val(3, pos_u);
+    e.dispatch(1, 1, 1, 32);
+  }
+
+  static const float t_beam_env = [] {
+    const char* v = getenv("NI_INK2_TREE_TEMP");
+    return (v && *v) ? float(atof(v)) : 0.0f;
+  }();
+  const float t_beam =
+      (t_beam_env > 0.0f) ? t_beam_env : (sp.temperature > 0.0f ? std::clamp(sp.temperature, 0.25f, 2.0f) : 1.0f);
+  const float inv_t_beam = 1.0f / t_beam;
+  const uint32_t tot_in = 2u * R + 2u * H;
+  const float softcap = trunk_.cfg_.logit_softcap;
+  const uint32_t has_sup = s.suppression ? 1u : 0u;
+  const uint32_t sup_words = has_sup ? uint32_t(s.suppression->words) : 0u;
+  const Buffer& sup_buf = has_sup ? s.suppression->mask : d_cand_i_;
+
+  for (int d = 0; d < D_max; ++d) {
+    const int active_b = (d == 0) ? 1 : std::min(4, R_b - 1);
+    const Buffer hidden_row = blk_norm_.view(size_t(1 + d) * H * 4, size_t(H) * 4);
+    {
+      const Ink2MtpBeamPrepP pp{R, H, d == 0 ? 1u : 0u};
+      e.use(mtp_pipe("ink2_mtp_beam_rnn_prep"));
+      e.buf(0, beam_meta_);
+      e.buf(1, beam_state_);
+      e.buf(2, markov_w1_->buf);
+      e.buf(3, hidden_row);
+      e.buf(4, s.conv[1]);
+      e.buf(5, beam_rnn_in_);
+      e.val(6, pp);
+      e.dispatch((tot_in + 255u) / 256u, uint32_t(active_b), 1, 256);
+    }
+
+    enc_mv(e, *rnn_proj_w_, beam_rnn_in_, beam_rnn_gates_, active_b, rnn_proj_b_);
+
+    {
+      const Ink2MtpBeamUpdP up{R, d == 0 ? 1u : 0u};
+      e.use(mtp_pipe("ink2_mtp_beam_rnn_update"));
+      e.buf(0, beam_meta_);
+      e.buf(1, beam_rnn_gates_);
+      e.buf(2, beam_state_);
+      e.buf(3, beam_next_state_);
+      e.buf(4, beam_latent_);
+      e.val(5, up);
+      e.dispatch(1, uint32_t(active_b), 1, 256);
+    }
+
+    {
+      const Ink2MtpP2ScreenP sp2{V, R, has_sup, sup_words};
+      e.use(mtp_pipe("ink2_mtp_p2_fold_screen_beam"));
+      e.buf(0, beam_meta_);
+      e.buf(1, beam_latent_);
+      e.buf(2, fold_p2_q_);
+      e.buf(3, fold_p2_s_);
+      e.buf(4, base_proxy_.view(size_t(d) * V * 2, size_t(V) * 2));
+      e.buf(5, sup_buf);
+      e.buf(6, beam_cand_v_);
+      e.buf(7, beam_cand_i_);
+      e.val(8, sp2);
+      e.dispatch(64, 1, 1, 256);
+    }
+
+    {
+      const Ink2MtpRescoreP rp2{V, H, R, unembed_->dtype == DType::F32 ? 1u : 0u, has_sup, sup_words, softcap,
+                                 softcap > 0.0f ? (1.0f / softcap) : 0.0f};
+      e.use(mtp_pipe("ink2_mtp_rescore_beam"));
+      e.buf(0, beam_meta_);
+      e.buf(1, hidden_row);
+      e.buf(2, beam_latent_);
+      e.buf(3, unembed_->buf);
+      e.buf(4, fold_w_);
+      e.buf(5, fold_b_);
+      e.buf(6, sup_buf);
+      e.buf(7, beam_cand_i_);
+      e.buf(8, beam_cand_v_);
+      e.val(9, rp2);
+      e.dispatch(32, uint32_t(active_b), 1, 128);
+    }
+
+    {
+      const Ink2MtpBeamStepP bsp{V, R, uint32_t(d), uint32_t(R_b), (d + 1 == D_max) ? 1u : 0u, inv_t_beam};
+      e.use(mtp_pipe("ink2_mtp_beam_step"));
+      e.buf(0, beam_meta_);
+      e.buf(1, cand_pool_);
+      e.buf(2, beam_cand_v_);
+      e.buf(3, beam_cand_i_);
+      e.buf(4, beam_next_state_);
+      e.buf(5, beam_state_);
+      e.val(6, bsp);
+      e.dispatch(1, 1, 1, 128);
+    }
+  }
+
+  {
+    const Ink2MtpTreeSelP tsp{uint32_t(R_b), uint32_t(P)};
+    e.use(mtp_pipe("ink2_mtp_tree_select"));
+    e.buf(0, beam_meta_);
+    e.buf(1, cand_pool_);
+    e.buf(2, tree_buf_);
+    e.buf(3, s.tok);
+    e.val(4, tsp);
+    e.dispatch(1, 1, 1, 128);
+  }
+}
+
+void Ink2Mtp::encode_accept_tree_gpu(Encoder& e, Seq& s, int P, int R, const Buffer& verify_logits,
+                                     const Buffer& verify_samples, const Buffer& accept_out,
+                                     const SamplingParams& sp, uint32_t step) const {
+  const uint32_t V = uint32_t(vocab_);
+  if (sp.temperature <= 0.0f) {
+    const Ink2MtpTreeAccP tp{V, sp.seed, step, uint32_t(P), 0.0f};
+    e.use(mtp_pipe("ink2_mtp_accept_tree_greedy"));
+    e.buf(0, tree_buf_);
+    e.buf(1, verify_samples);
+    e.buf(2, s.tok);
+    e.buf(3, accept_out);
+    e.val(4, tp);
+    e.dispatch(1, 1, 1, 32);
+    return;
+  }
+  const Ink2MtpTreeAccP tp{V, sp.seed, step, uint32_t(P), 1.0f / sp.temperature};
+  if (sp.top_k <= 0 && sp.top_p >= 1.0f) {
+    const Ink2MtpAccP ap{uint32_t(R), 0u, V, 0u, 1u, sp.seed, step, uint32_t(P), 0u, 0u, tp.inv_t, sp.top_p};
+    e.use(mtp_pipe("ink2_mtp_row_logz"));
+    e.buf(0, verify_logits);
+    e.buf(1, verify_logits);
+    e.buf(2, acc_stats_);
+    e.val(3, ap);
+    e.dispatch(uint32_t(R), 1, 1, 512);
+
+    e.use(mtp_pipe("ink2_mtp_accept_tree_full_decide"));
+    e.buf(0, tree_buf_);
+    e.buf(1, verify_logits);
+    e.buf(2, acc_stats_);
+    e.buf(3, s.tok);
+    e.buf(4, accept_out);
+    e.val(5, tp);
+    e.dispatch(1, 1, 1, 32);
+
+    e.use(mtp_pipe("ink2_mtp_sample_emit_tree_stage1"));
+    e.buf(0, tree_buf_);
+    e.buf(1, verify_logits);
+    e.buf(2, acc_stats_);
+    e.buf(3, accept_out);
+    e.buf(4, acc_cand_v_);
+    e.buf(5, acc_cand_i_);
+    e.val(6, tp);
+    e.dispatch(64, 1, 1, 256);
+
+    e.use(mtp_pipe("ink2_mtp_sample_emit_tree_stage2"));
+    e.buf(0, acc_cand_v_);
+    e.buf(1, acc_cand_i_);
+    e.buf(2, accept_out);
+    e.buf(3, s.tok);
+    e.val(4, tp);
+    e.dispatch(1, 1, 1, 64);
+    return;
+  }
+
+  const uint32_t Ktop = uint32_t(std::clamp(sp.top_k, 1, kTopkMax));
+  const uint32_t chunk = topk_chunk(Ktop);
+  const uint32_t lists = topk_lists(V, Ktop);
+  const Ink2MtpAccP ap{uint32_t(R), 0u, V, Ktop, 1u, sp.seed, step, uint32_t(P), lists, chunk, tp.inv_t, sp.top_p};
+  e.use(mtp_pipe("ink2_mtp_topk_stage1_rows"));
+  e.buf(0, verify_logits);
+  e.buf(1, verify_logits);
+  e.buf(2, acc_cand_v_);
+  e.buf(3, acc_cand_i_);
+  e.val(4, ap);
+  e.dispatch(lists, uint32_t(R), 1, topk_threads(Ktop));
+
+  e.use(mtp_pipe("ink2_mtp_topk_stage2_dists"));
+  e.buf(0, acc_cand_v_);
+  e.buf(1, acc_cand_i_);
+  e.buf(2, acc_dists_);
+  e.val(3, ap);
+  e.dispatch(uint32_t(R), 1, 1, 1024);
+
+  e.use(mtp_pipe("ink2_mtp_accept_tree_topk_decide"));
+  e.buf(0, tree_buf_);
+  e.buf(1, acc_dists_);
+  e.buf(2, s.tok);
+  e.buf(3, accept_out);
+  e.val(4, tp);
+  e.dispatch(1, 1, 1, 32);
+}
+
+Ink2TreeAccept Ink2Mtp::accept_tree(Seq& s, int P, const Buffer& verify_logits, const Buffer& verify_samples,
+                                    const Buffer& accept_out, const SamplingParams& sp, uint32_t step,
+                                    bool gpu_accepted) const {
+  if (gpu_accepted && accept_out) {
+    const Ink2TreeAccept acc = *accept_out.as<Ink2TreeAccept>();
+    if (acc.ok == 1) return acc;
+  }
+  return ink2_mtp_accept_tree_cpu(s.tokens(), P, *tree_buf_.as<Ink2Tree>(), vocab_, verify_logits.as<float>(),
+                                  verify_samples.as<int>(), sp, step);
 }
 
 }  // namespace ni

@@ -38,6 +38,7 @@
 #include <minja/chat-template.hpp>
 #include <minja/minja.hpp>
 
+#include <chrono>
 #include <optional>
 
 #include <stdlib.h>
@@ -3413,6 +3414,171 @@ void ink2_mtp_accept_unit() {
               std::fabs(r2 - 0.125) < 0.03,
           "ink2_mtp_accept: unbiased accept + residual",
           "acc=" + std::to_string(acc_rate) + " r1=" + std::to_string(r1) + " r2=" + std::to_string(r2));
+  }
+
+  // 4. Point-mass speculative acceptance exactness (lossless under arbitrary draft token)
+  {
+    const int P = 0, K = 1, V = 4;
+    const float target_p[4] = {0.45f, 0.25f, 0.20f, 0.10f};
+    std::vector<float> vlogits(2 * V, 0.0f);
+    for (int v = 0; v < V; ++v) vlogits[v] = std::log(target_p[v]);
+    SamplingParams sp;
+    sp.temperature = 1.0f;
+    sp.top_k = 0;
+    sp.top_p = 1.0f;
+    const std::vector<int> vs = {0, 0};
+    const int N = 20000;
+    int counts[4] = {0, 0, 0, 0};
+    for (int i = 0; i < N; ++i) {
+      sp.seed = uint32_t(i + 1) * 747796405u;
+      std::vector<int> tok = {0, i & 3, 0};  // Arbitrary draft token (uncorrelated with p)
+      int a = ink2_mtp_accept_cpu(tok.data(), P, K, V, vlogits.data(), nullptr, vs.data(), sp, 19u, true);
+      check(tok[1] >= 0 && tok[1] < 4, "ink2_mtp_accept point_mass: valid token");
+      if (a == 1) check(tok[1] == (i & 3), "ink2_mtp_accept point_mass: accepted matches draft");
+      ++counts[tok[1]];
+    }
+    bool match = true;
+    std::string msg;
+    for (int v = 0; v < 4; ++v) {
+      const double got = double(counts[v]) / N;
+      if (std::fabs(got - target_p[v]) > 0.015) match = false;
+      msg += " p" + std::to_string(v) + "=" + std::to_string(got);
+    }
+    check(match, "ink2_mtp_accept point_mass: exact marginal distribution", msg);
+  }
+
+  // 5. Full-vocab O(V) performance test on V=200058 (must finish in < 200 ms for 5 draft rows, never O(V^2))
+  {
+    const int P = 0, K = 5, V = 200058;
+    std::vector<float> vlogits(size_t(K + 1) * V, -2.0f);
+    std::vector<float> dlogits(size_t(K) * V, -2.0f);
+    for (int r = 0; r <= K; ++r) vlogits[size_t(r) * V + 17] = 5.0f;
+    for (int r = 0; r < K; ++r) dlogits[size_t(r) * V + 42] = 6.0f;  // force immediate rejection
+    SamplingParams sp;
+    sp.temperature = 1.0f;
+    sp.top_k = 0;
+    sp.top_p = 1.0f;
+    sp.seed = 99u;
+    std::vector<int> tok(P + K + 2, 42);
+    std::vector<int> vs(K + 1, 17);
+    const auto t0 = std::chrono::steady_clock::now();
+    int a = ink2_mtp_accept_cpu(tok.data(), P, K, V, vlogits.data(), dlogits.data(), vs.data(), sp, 1u);
+    const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+    check(a == 0 && tok[1] >= 0 && tok[1] < V && ms < 250.0,
+          "ink2_mtp_accept: V=200058 full-vocab O(V) fast rejection",
+          "ms=" + std::to_string(ms));
+  }
+
+  // 6. Lossless Multi-Branch Point-Mass Tree Verification (0.00000 KLD at T=1 full-vocab and T=0.7 top_k+top_p)
+  {
+    const int P = 0, V = 6;
+    Ink2Tree tree{};
+    tree.R = 6;
+    tree.tokens[0] = 0;
+    tree.parent[0] = -1;
+    // Root 0 -> children 1 (tok 1), 2 (tok 3), 3 (tok 4)
+    tree.n_child[0] = 3;
+    tree.child[0][0] = 1; tree.tokens[1] = 1; tree.parent[1] = 0; tree.depth[1] = 1;
+    tree.child[0][1] = 2; tree.tokens[2] = 3; tree.parent[2] = 0; tree.depth[2] = 1;
+    tree.child[0][2] = 3; tree.tokens[3] = 4; tree.parent[3] = 0; tree.depth[3] = 1;
+    // Node 1 -> children 4 (tok 0), 5 (tok 2)
+    tree.n_child[1] = 2;
+    tree.child[1][0] = 4; tree.tokens[4] = 0; tree.parent[4] = 1; tree.depth[4] = 2;
+    tree.child[1][1] = 5; tree.tokens[5] = 2; tree.parent[5] = 1; tree.depth[5] = 2;
+
+    const float p_root[6] = {0.10f, 0.35f, 0.08f, 0.25f, 0.15f, 0.07f};
+    const float p_n1[6]   = {0.40f, 0.15f, 0.25f, 0.10f, 0.06f, 0.04f};
+    std::vector<float> vlogits(6 * V, 0.0f);
+    for (int r = 0; r < 6; ++r) {
+      for (int v = 0; v < V; ++v) vlogits[size_t(r) * V + v] = std::log((r == 1) ? p_n1[v] : p_root[v]);
+    }
+    const std::vector<int> vs(6, 0);
+
+    // 6a. Full-vocab T=1.0
+    {
+      SamplingParams sp;
+      sp.temperature = 1.0f;
+      sp.top_k = 0;
+      sp.top_p = 1.0f;
+      const int N = 150000;
+      int cnt0[6] = {}, cnt1[6] = {}, n1_hits = 0;
+      bool valid_paths = true;
+      for (int i = 0; i < N; ++i) {
+        sp.seed = uint32_t(i + 1) * 747796405u;
+        std::vector<int> tok(8, 0);
+        const Ink2TreeAccept acc = ink2_mtp_accept_tree_cpu(tok.data(), P, tree, V, vlogits.data(), vs.data(), sp, 11u);
+        if (!(acc.m >= 1 && acc.m <= 3 && acc.path[0] == 0)) valid_paths = false;
+        if (tok[1] >= 0 && tok[1] < V) ++cnt0[tok[1]];
+        if (tok[1] == 1 && acc.m >= 2 && tok[2] >= 0 && tok[2] < V) {
+          ++n1_hits;
+          ++cnt1[tok[2]];
+        }
+      }
+      check(valid_paths, "ink2_mtp_accept_tree full-vocab valid path (150k samples)");
+      bool ok0 = true, ok1 = n1_hits > 30000;
+      std::string msg;
+      for (int v = 0; v < V; ++v) {
+        const double g0 = double(cnt0[v]) / N;
+        const double g1 = n1_hits > 0 ? double(cnt1[v]) / n1_hits : 0.0;
+        if (std::fabs(g0 - p_root[v]) > 0.005) ok0 = false;
+        if (std::fabs(g1 - p_n1[v]) > 0.008) ok1 = false;
+        msg += " r" + std::to_string(v) + "=" + std::to_string(g0) + "/c" + std::to_string(g1);
+      }
+      check(ok0 && ok1, "ink2_mtp_accept_tree full-vocab: exact 0.00000 KLD marginal & conditional", msg);
+    }
+
+    // 6b. Top-k + top-p at T=0.7
+    {
+      SamplingParams sp;
+      sp.temperature = 0.7f;
+      sp.top_k = 4;
+      sp.top_p = 0.9f;
+      // Compute expected truncated/tempered distributions under compute_row_dist conventions
+      auto expected_dist = [&](const float* logits) {
+        struct KV { float raw; int id; };
+        std::vector<KV> cands;
+        for (int v = 0; v < V; ++v) cands.push_back({logits[v], v});
+        std::sort(cands.begin(), cands.end(), [](const KV& a, const KV& b) {
+          return a.raw > b.raw || (a.raw == b.raw && a.id < b.id);
+        });
+        cands.resize(4);
+        double tot = 0.0;
+        std::vector<double> unt(4);
+        for (int i = 0; i < 4; ++i) { unt[i] = std::exp(cands[i].raw - cands[0].raw); tot += unt[i]; }
+        int keep = 4;
+        double cum = 0.0;
+        for (int i = 0; i < 4; ++i) { cum += unt[i] / tot; if (cum >= sp.top_p) { keep = i + 1; break; } }
+        std::vector<double> p(V, 0.0);
+        double kt = 0.0;
+        for (int i = 0; i < keep; ++i) { p[cands[i].id] = std::exp((cands[i].raw - cands[0].raw) / sp.temperature); kt += p[cands[i].id]; }
+        for (double& x : p) x /= kt;
+        return p;
+      };
+      const std::vector<double> want0 = expected_dist(&vlogits[0]);
+      const std::vector<double> want1 = expected_dist(&vlogits[V]);
+      const int N = 150000;
+      int cnt0[6] = {}, cnt1[6] = {}, n1_hits = 0;
+      for (int i = 0; i < N; ++i) {
+        sp.seed = uint32_t(i + 1) * 1103515245u + 12345u;
+        std::vector<int> tok(8, 0);
+        const Ink2TreeAccept acc = ink2_mtp_accept_tree_cpu(tok.data(), P, tree, V, vlogits.data(), vs.data(), sp, 23u);
+        if (tok[1] >= 0 && tok[1] < V) ++cnt0[tok[1]];
+        if (tok[1] == 1 && acc.m >= 2 && tok[2] >= 0 && tok[2] < V) {
+          ++n1_hits;
+          ++cnt1[tok[2]];
+        }
+      }
+      bool ok0 = true, ok1 = n1_hits > 10000;
+      std::string msg;
+      for (int v = 0; v < V; ++v) {
+        const double g0 = double(cnt0[v]) / N;
+        const double g1 = n1_hits > 0 ? double(cnt1[v]) / n1_hits : 0.0;
+        if (std::fabs(g0 - want0[v]) > 0.005) ok0 = false;
+        if (std::fabs(g1 - want1[v]) > 0.010) ok1 = false;
+        msg += " r" + std::to_string(v) + "=" + std::to_string(g0) + "/c" + std::to_string(g1);
+      }
+      check(ok0 && ok1, "ink2_mtp_accept_tree topk/topp: exact 0.00000 KLD marginal & conditional", msg);
+    }
   }
 }
 

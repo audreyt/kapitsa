@@ -473,8 +473,9 @@ NI_INLINE void ink2t_load_kv(threadgroup half* kv_tile, const device void* src, 
     uint tid [[thread_index_in_threadgroup]], uint sg [[simdgroup_index_in_threadgroup]],
     uint lane [[thread_index_in_simdgroup]]) {
   constexpr uint BM = 16, BK = 32, D = 128;
-  const uint row0 = tg.x * BM, h = tg.y;
-  if (row0 >= p.T) return;
+  const uint nq = (p.T + BM - 1u) / BM;
+  if (tg.x >= nq) return;
+  const uint row0 = (nq - 1u - tg.x) * BM, h = tg.y;
   const uint hkv = h / (p.Hq / p.Hkv), valid_q = min(BM, p.T - row0);
   // Align k_first to the global 32-key grid so key tiles do not depend on prefill chunk boundaries.
   const uint k_min_need = p.is_swa ? uint(max(0, int(p.pos0 + row0) + 1 - int(p.swa))) : 0u;
@@ -482,9 +483,10 @@ NI_INLINE void ink2t_load_kv(threadgroup half* kv_tile, const device void* src, 
 
   threadgroup float4 kv_or_o[512];
   threadgroup half q_tile[BM * D], probs[BM * BK];
-  threadgroup float s_tile[BM * BK], sprior[BM], tg_m[BM], tg_l[BM];
-  static_assert(sizeof(kv_or_o) + sizeof(q_tile) + sizeof(s_tile) + sizeof(probs) + sizeof(sprior) + sizeof(tg_m) +
-                        sizeof(tg_l) <= 16384, "ink2_attn_prefill_t tgmem exceeds 16 KB");
+  threadgroup float s_tile[BM * BK], sprior[BM], tg_l[BM];
+  static_assert(sizeof(kv_or_o) + sizeof(q_tile) + sizeof(s_tile) + sizeof(probs) + sizeof(sprior) + sizeof(tg_l) <=
+                    16384,
+                "ink2_attn_prefill_t tgmem exceeds 16 KB");
   threadgroup half* kv_tile = (threadgroup half*)kv_or_o;
   threadgroup float* o_tile = (threadgroup float*)kv_or_o;
 
@@ -510,7 +512,17 @@ NI_INLINE void ink2t_load_kv(threadgroup half* kv_tile, const device void* src, 
   _Pragma("clang loop unroll(full)")
   for (uint16_t i = 0; i < acc_o.get_capacity(); ++i) acc_o[i] = 0.0f;
 
-  float row_m[4] = {-INFINITY, -INFINITY, -INFINITY, -INFINITY}, row_l[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+  float row_m[4], row_l[4];
+  for (uint k = 0; k < 4; ++k) {
+    const uint r = sg + k * 4;
+    if (r < valid_q) {
+      row_m[k] = sinks[size_t(row0 + r) * p.Hq + h];
+      row_l[k] = 1.0f;
+    } else {
+      row_m[k] = -INFINITY;
+      row_l[k] = 0.0f;
+    }
+  }
   const uint col = sg * 32 + lane;
   for (uint k0 = k_first; k0 <= k_last; k0 += BK) {
     ink2t_load_kv(kv_tile, kc, tid, hkv, k0, k_min_need, k_last, p.kv_cap, p.Hkv, p.is_swa, p.kv_fp8);
@@ -518,25 +530,43 @@ NI_INLINE void ink2t_load_kv(threadgroup half* kv_tile, const device void* src, 
     if (sg < 2u) qk_op.run(tQ, tK, tS);
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    for (uint k = 0; k < 4; ++k) {
-      const uint r = sg + k * 4, qrow = row0 + r;
-      const int qpos = int(p.pos0 + qrow);
-      const device float* rbh = rb + (size_t(min(qrow, p.T - 1)) * p.Hq + h) * p.rel_extent;
-      float sc0 = -INFINITY;
-      if (r < valid_q) {
-        const int kp0 = int(k0 + lane), d0 = qpos - kp0;
-        if (kp0 >= int(k_min_need) && kp0 <= int(k_last) && d0 >= 0 && (!p.is_swa || d0 < int(p.swa))) {
-          sc0 = s_tile[r * BK + lane];
-          if (d0 < int(p.rel_extent)) sc0 += rbh[d0];
-        }
+    const bool full_far_tile = (k0 >= k_min_need) && (k0 + BK - 1u <= p.pos0 + row0) &&
+                               ((p.pos0 + row0) - (k0 + BK - 1u) >= p.rel_extent) &&
+                               (!p.is_swa || (p.pos0 + row0 + valid_q - 1u) - k0 < p.swa);
+    if (full_far_tile) {
+      for (uint k = 0; k < 4; ++k) {
+        const uint r = sg + k * 4;
+        const bool r_ok = r < valid_q;
+        const float sc0 = r_ok ? s_tile[r * BK + lane] : -INFINITY;
+        const float rmax = simd_max(sc0), prev_m = row_m[k], nm = max(prev_m, rmax);
+        const float prior = r_ok ? metal::precise::exp(prev_m - nm) : 0.0f;
+        const float w0 = r_ok ? metal::precise::exp(sc0 - nm) : 0.0f;
+        probs[r * BK + lane] = half(w0);
+        row_l[k] = fma(row_l[k], prior, simd_sum(w0));
+        row_m[k] = nm;
+        if (lane == 0) sprior[r] = prior;
       }
-      const float rmax = simd_max(sc0), prev_m = row_m[k], nm = max(prev_m, rmax);
-      const float prior = (isfinite(prev_m) && isfinite(nm)) ? metal::precise::exp(prev_m - nm) : 0.0f;
-      const float w0 = isfinite(sc0) ? metal::precise::exp(sc0 - nm) : 0.0f;
-      probs[r * BK + lane] = half(w0);
-      row_l[k] = fma(row_l[k], prior, simd_sum(w0));
-      row_m[k] = nm;
-      if (lane == 0) sprior[r] = prior;
+    } else {
+      for (uint k = 0; k < 4; ++k) {
+        const uint r = sg + k * 4, qrow = row0 + r;
+        const int qpos = int(p.pos0 + qrow);
+        const device float* rbh = rb + (size_t(min(qrow, p.T - 1)) * p.Hq + h) * p.rel_extent;
+        float sc0 = -INFINITY;
+        if (r < valid_q) {
+          const int kp0 = int(k0 + lane), d0 = qpos - kp0;
+          if (kp0 >= int(k_min_need) && kp0 <= int(k_last) && d0 >= 0 && (!p.is_swa || d0 < int(p.swa))) {
+            sc0 = s_tile[r * BK + lane];
+            if (d0 < int(p.rel_extent)) sc0 += rbh[d0];
+          }
+        }
+        const float rmax = simd_max(sc0), prev_m = row_m[k], nm = max(prev_m, rmax);
+        const float prior = (r < valid_q) ? metal::precise::exp(prev_m - nm) : 0.0f;
+        const float w0 = isfinite(sc0) ? metal::precise::exp(sc0 - nm) : 0.0f;
+        probs[r * BK + lane] = half(w0);
+        row_l[k] = fma(row_l[k], prior, simd_sum(w0));
+        row_m[k] = nm;
+        if (lane == 0) sprior[r] = prior;
+      }
     }
 
     threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -552,13 +582,11 @@ NI_INLINE void ink2t_load_kv(threadgroup half* kv_tile, const device void* src, 
 
   acc_o.store(tg_f_t(o_tile + sg * 32, dextents<int32_t, 2>(32, BM), array<int32_t, 2>{1, int32_t(D)}));
   if (lane == 0) {
-    for (uint k = 0; k < 4; ++k) { tg_m[sg + k * 4] = row_m[k]; tg_l[sg + k * 4] = row_l[k]; }
+    for (uint k = 0; k < 4; ++k) tg_l[sg + k * 4] = row_l[k];
   }
   threadgroup_barrier(mem_flags::mem_threadgroup);
   for (uint r = 0; r < valid_q; ++r) {
     const size_t qoff = (size_t(row0 + r) * p.Hq + h) * D + col;
-    const float sk = sinks[size_t(row0 + r) * p.Hq + h], mf = tg_m[r], lf = tg_l[r], nm = max(mf, sk);
-    const float corr = isfinite(mf) ? metal::precise::exp(mf - nm) : 0.0f;
-    out[qoff] = (o_tile[r * D + col] * corr / (lf * corr + metal::precise::exp(sk - nm))) * sigmoid(gate[qoff]);
+    out[qoff] = (o_tile[r * D + col] / tg_l[r]) * sigmoid(gate[qoff]);
   }
 }

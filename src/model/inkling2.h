@@ -124,11 +124,18 @@ class Inkling2 : public Model {
   void encode_prefill(Encoder& e, Seq& s, int pos0, int T, const SamplingParams& sp, uint32_t step, bool sample,
                       Checkpoint* snap = nullptr, int snap_row = 0) override;
 
-  // MTP speculative decoding
+  // MTP speculative decoding (linear + Bayes-Optimal W=4 Beam Tree)
+  bool can_tree_spec() const;
   void encode_mtp_draft(Encoder& e, Seq& s, int P, int K, const SamplingParams& sp, uint32_t step);
-  void encode_mtp_verify(Encoder& e, Seq& s, int P, int R, const SamplingParams& sp, uint32_t step);
-  int accept_mtp(Seq& s, int P, int K, const SamplingParams& sp, uint32_t step) const;
+  void encode_mtp_verify(Encoder& e, Seq& s, int P, int R, const SamplingParams& sp, uint32_t step,
+                         bool point_mass = false);
+  int accept_mtp(Seq& s, int P, int K, const SamplingParams& sp, uint32_t step, bool point_mass = false) const;
   void encode_mtp_commit(Encoder& e, Seq& s, int pos0, int m);
+
+  void encode_mtp_draft_tree(Encoder& e, Seq& s, int P, int R, const SamplingParams& sp);
+  void encode_mtp_verify_tree(Encoder& e, Seq& s, int P, int R, const SamplingParams& sp, uint32_t step);
+  int accept_mtp_tree(Seq& s, int P, const SamplingParams& sp, uint32_t step, int* out_path) const;
+  void encode_mtp_commit_tree(Encoder& e, Seq& s, int pos0, const int* path, int m);
 
   // Diagnostic helpers (tools/ink2_check)
   float* logits() { return logits_.as<float>(); }
@@ -146,10 +153,13 @@ class Inkling2 : public Model {
   bool is_swa_slot(size_t slot) const;
   size_t kv_elem_bytes(size_t slot) const { return (use_kv_fp8_ && slot < cfg_.schedule.size()) ? 1u : 2u; }
   void enc_forward(Encoder& e, Seq& s, int pos0, int T, bool dump_logits, const Buffer* out_logits, bool need_all_logits,
-                   const Buffer* diag_rows = nullptr, bool capture_taps = false, bool save_conv_snaps = false);
+                   const Buffer* diag_rows = nullptr, bool capture_taps = false, bool save_conv_snaps = false,
+                   const Buffer* tree_buf = nullptr);
   void enc_mm(Encoder& e, const Tensor& w, const Buffer& x, const Buffer& y, int M, uint32_t N_limit = 0, bool add = false,
               bool exact_f32 = false);
   void enc_q8_mv(Encoder& e, const Buffer& wq, const Buffer& ws, uint32_t N, uint32_t K, const Buffer& x,
+                 const Buffer& y, int M, bool add = false, float softcap = 0.0f);
+  void enc_q4_mv(Encoder& e, const Buffer& wq, const Buffer& wsb, uint32_t N, uint32_t K, const Buffer& x,
                  const Buffer& y, int M, bool add = false);
   void enc_unembed(Encoder& e, const Buffer& x, const Buffer& y, int M, bool apply_softcap);
   void enc_norm(Encoder& e, const Buffer& x, const Tensor* w, const Buffer& out, int T, uint32_t dim);
@@ -178,8 +188,10 @@ class Inkling2 : public Model {
   bool use_tensor_ = false;
   bool use_q8_dense_ = false;
   bool use_q8_head_ = false;
+  bool use_q4_head_ = false;
   bool use_kv_fp8_ = false;
   Buffer unembed_q_, unembed_s_;
+  Buffer unembed_q4_, unembed_sb_;
 
   // Reusable activations sized for `tmax_` rows
   Buffer x_, x_pre_, inp_sa_, ffn_inp_, h_norm_;
@@ -187,16 +199,18 @@ class Inkling2 : public Model {
   Buffer prelude_blocks_[4];
   Buffer ar_out_;           // attn_res output: up to 4 * tmax * H
   Buffer msg_out_;          // cross-pass messages: 4 * tmax * H
+  Buffer pass_msg_out_;     // hoisted cross-pass messages (T <= 16): [12, 4, 16, H]
   Buffer mg_cat_, mg_lat_;  // split MessageGate staging buffers (T <= 16)
   Buffer mg_f_, mg_g_;
   Buffer n0_, n1_, n2_;     // normed inputs [tmax, H]
   Buffer q_, k_, v_, r_, sinks_, gate_attn_, att_out_, a_out_;
-  Buffer dyn_, rb_, part_m_, part_l_, part_o_;
+  Buffer dyn_, dyn_v_, rb_, part_m_, part_l_, part_o_;
   Buffer h_mlp_, x_mlp_, rlog_, eid_, ew_, moe_act_, moe_out_;
   Buffer moe_tiles_, moe_ntiles_, moe_st_tok_, moe_st_pair_, moe_st_ew_, moe_pair_out_;
   Buffer logits_, cand_v_, cand_i_, sprob_, samp_;
   std::unique_ptr<Ink2Mtp> mtp_;
-  Buffer tap_[3], verify_conv_, verify_logits_, verify_samples_;
+  Buffer tap_[3], verify_conv_, verify_logits_, verify_samples_, verify_accept_, verify_tree_accept_;
+  mutable bool last_gpu_accept_ = false;
 };
 
 }  // namespace ni

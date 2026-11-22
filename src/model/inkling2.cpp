@@ -140,16 +140,20 @@ void prewarm_pipelines() {
   if (const char* v = getenv("NI_PREWARM"); v && !strcmp(v, "0")) return;
   static const char* const kInk2Names[] = {
       "ink2_copy_bytes",       "ink2_bf16_mv",           "ink2_bf16_mv4",         "ink2_bf16_mv4_multi6",
-      "ink2_bf16_mv8",         "ink2_bf16_mv8_multi6",  "ink2_bf16_mm",          "ink2_rmsnorm",
-      "ink2_attn_res",         "ink2_msg_gate",         "ink2_msg_gate_prep_s",  "ink2_msg_gate_down_s",
-      "ink2_msg_gate_up_mix_s","ink2_msg_gate_up_mix_norm_s",
+      "ink2_bf16_mv8",         "ink2_bf16_mv8_multi6",   "ink2_bf16_mv_smalln",   "ink2_bf16_mm",
+      "ink2_rmsnorm",          "ink2_rmsnorm3",          "ink2_attn_res",         "ink2_attn_res_pass",
+      "ink2_msg_gate",         "ink2_msg_gate_prep_s",   "ink2_msg_gate_prep3_s", "ink2_msg_gate_down_s",
+      "ink2_msg_gate_down3_s", "ink2_msg_gate_up_mix_s", "ink2_msg_gate_up_mix3_s","ink2_msg_gate_up_mix_norm_s",
       "ink2_embed_norm",       "ink2_sconv_static",      "ink2_sconv_static_pf",  "ink2_sconv_dynamic",    "ink2_qkvr_prep",         "ink2_rel_bias",         "ink2_rel_bias_pf",
       "ink2_attn_decode",      "ink2_attn_decode_reduce","ink2_attn_decode_1pass","ink2_attn_verify",      "ink2_attn_verify2",     "ink2_attn_verify_reduce","ink2_attn_prefill",     "ink2_moe_route",
+      "ink2_attn_decode_gqa_global", "ink2_attn_decode_gqa_swa", "ink2_attn_decode_1pass_gqa_global", "ink2_attn_decode_1pass_gqa_swa", "ink2_attn_verify_gqa",
       "ink2_moe_nvfp4_w13_situ","ink2_moe_nvfp4_w2_acc", "ink2_moe_mxfp8_w13_situ","ink2_moe_mxfp8_w2_acc",
       "ink2_moe_bucket_small", "ink2_moe_nvfp4_w13_g",   "ink2_moe_nvfp4_w2_g",   "ink2_moe_mxfp8_w13_g",
       "ink2_moe_mxfp8_w2_g",   "ink2_moe_reduce8_m3",    "ink2_mtp_argmax_stage1","ink2_mtp_argmax_stage2",
       "ink2_softcap",          "ink2_quant_q8_bf16",     "ink2_q8_mv4",           "ink2_q8_mv8",
-      "ink2_q8_mv4_multi6",    "ink2_q8_mv8_multi6",
+      "ink2_q8_mv4_multi6",    "ink2_q8_mv8_multi6",     "ink2_quant_q4g64_bf16", "ink2_q4g64_mv4",
+      "ink2_q4g64_mv8",        "ink2_sconv_static_tree", "ink2_sconv_dynamic_tree","ink2_qkvr_prep_tree",
+      "ink2_attn_verify_tree_gqa", "ink2_kv_compact",    "ink2_gather_rows",
   };
   for (const char* n : kInk2Names) (void)ink2_pipe(n);
   (void)base_pipe("topk_stage1");
@@ -189,11 +193,18 @@ struct Ink2QuantQ8P {
 };
 struct Ink2Q8MmP {
   uint32_t M, N, K, nblk, add;
+  float cap, inv_cap;
 };
 struct Ink2Q8Multi6P {
   uint32_t M, K, N_tot, n_segs, nblk;
   uint32_t offs[7];
   uint32_t lens[6];
+};
+struct Ink2QuantQ4P {
+  uint32_t total_groups;
+};
+struct Ink2Q4MmP {
+  uint32_t M, N, K, ngroups, add;
 };
 struct Ink2SconvStaticP {
   uint32_t T, C, w_f32, save_snap, snap_stride, add_res;
@@ -235,6 +246,14 @@ struct Ink2MoeP {
 struct Ink2SoftcapP {
   uint32_t n;
   float cap, inv_cap;
+};
+struct Ink2KvCompactP {
+  uint32_t pos0, kv_cap, is_swa, kv_fp8, kvd, m;
+  uint32_t path[16];
+};
+struct Ink2GatherP {
+  uint32_t m, H;
+  uint32_t path[16];
 };
 
 const json& text_cfg(const json& root) { return root.contains("text_config") ? root["text_config"] : root; }
@@ -514,10 +533,15 @@ Inkling2::Inkling2(const std::string& path, int prefill_chunk) {
   use_tensor_ = want_ink2_tensor() && init_tensor_kernels();
   use_q8_dense_ = want_ink2_q8_dense() && (cfg_.hidden & 255) == 0 && ((cfg_.hq * cfg_.head_dim) & 255) == 0;
   use_kv_fp8_ = want_ink2_kv_fp8();
-  if (const char* he = getenv("NI_INK2_Q8_HEAD"); he && *he) {
+  if (const char* q4e = getenv("NI_INK2_Q4_HEAD"); q4e && *q4e) {
+    use_q4_head_ = (atoi(q4e) != 0) && (cfg_.hidden & 255) == 0;
+    use_q8_head_ = false;
+  } else if (const char* he = getenv("NI_INK2_Q8_HEAD"); he && *he) {
     use_q8_head_ = (atoi(he) != 0) && (cfg_.hidden & 255) == 0;
+    use_q4_head_ = false;
   } else {
     use_q8_head_ = use_q8_dense_;
+    use_q4_head_ = false;
   }
   load();
 }
@@ -541,6 +565,7 @@ void Inkling2::disable_mtp() {
   g.release(verify_conv_);
   g.release(verify_logits_);
   g.release(verify_samples_);
+  g.release(verify_accept_);
 }
 
 Inkling2::~Inkling2() {
@@ -740,7 +765,7 @@ void Inkling2::load() {
   }
 
   Gpu::get().make_resident(ws_.buffers());
-  if (use_q8_dense_ || use_q8_head_) {
+  if (use_q8_dense_ || use_q8_head_ || use_q4_head_) {
     auto e_q = Gpu::get().begin();
     auto quant_mat = [&](const Buffer& src, size_t rows, size_t cols, Buffer& out_q, Buffer& out_s, const char* tag) {
       const uint32_t tblks = uint32_t(rows * (cols / 32));
@@ -765,7 +790,22 @@ void Inkling2::load() {
         if (L.wo_ud && L.wo_ud->dtype == DType::BF16) quant_mat(L.wo_ud->buf, H, QD, L.wo_q, L.wo_s, "ink2_wo_q8");
       }
     }
-    if (use_q8_head_ && unembed_ && unembed_->dtype == DType::BF16) {
+    if (use_q4_head_ && unembed_ && unembed_->dtype == DType::BF16) {
+      const size_t V = size_t(cfg_.vocab);
+      const size_t H = size_t(cfg_.hidden);
+      const uint32_t tgrps = uint32_t(V * (H / 64));
+      unembed_q4_ = Gpu::get().alloc(V * (H / 2), "ink2_head_q4");
+      unembed_sb_ = Gpu::get().alloc(size_t(tgrps) * 4, "ink2_head_q4sb");
+      owned_bufs_.push_back(unembed_q4_);
+      owned_bufs_.push_back(unembed_sb_);
+      const Ink2QuantQ4P qp{tgrps};
+      e_q->use(ink2_pipe("ink2_quant_q4g64_bf16"));
+      e_q->buf(0, unembed_->buf);
+      e_q->buf(1, unembed_q4_);
+      e_q->buf(2, unembed_sb_);
+      e_q->val(3, qp);
+      e_q->dispatch((tgrps + 3) / 4, 1, 1, 128);
+    } else if (use_q8_head_ && unembed_ && unembed_->dtype == DType::BF16) {
       quant_mat(unembed_->buf, size_t(cfg_.vocab), size_t(cfg_.hidden), unembed_q_, unembed_s_, "ink2_head_q8");
     }
     e_q->commit_and_wait();
@@ -777,8 +817,8 @@ void Inkling2::load() {
   }
   alloc_buffers();
   Gpu::get().make_resident(owned_bufs_);
-  logi("loaded %s: Inkling-2-Mini (24 layers / 48 visits, vocab %d, q8_dense=%d, q8_head=%d, kv_fp8=%d), %.2f GB text weights in %.0f ms",
-       path_.c_str(), cfg_.vocab, use_q8_dense_ ? 1 : 0, use_q8_head_ ? 1 : 0, use_kv_fp8_ ? 1 : 0,
+  logi("loaded %s: Inkling-2-Mini (24 layers / 48 visits, vocab %d, q8_dense=%d, q8_head=%d, q4_head=%d, kv_fp8=%d), %.2f GB text weights in %.0f ms",
+       path_.c_str(), cfg_.vocab, use_q8_dense_ ? 1 : 0, use_q8_head_ ? 1 : 0, use_q4_head_ ? 1 : 0, use_kv_fp8_ ? 1 : 0,
        ws_.total_bytes() / 1e9, now_ms() - t0);
 }
 
@@ -802,14 +842,16 @@ void Inkling2::alloc_buffers() {
   for (int i = 0; i < 4; ++i) prelude_blocks_[i] = alloc(T * H * 4, "ink2_pre_block");
   ar_out_ = alloc(4 * T * H * 4, "ink2_ar");
   msg_out_ = alloc(4 * T * H * 4, "ink2_msg");
+  const size_t ncore = size_t(cfg_.core_end - cfg_.core_start);
+  pass_msg_out_ = alloc(ncore * 4 * 16 * H * 4, "ink2_pass_msg");
   mg_cat_ = alloc(std::max<size_t>(use_tensor_ ? T : 0, 3 * 16) * 2 * H * 4, "ink2_mg_cat");
   mg_lat_ = alloc(std::max<size_t>(use_tensor_ ? T : 0, 3 * 16) * size_t(cfg_.gate_rank) * 4, "ink2_mg_lat");
   if (use_tensor_) {
     mg_f_ = alloc(T * H * 4, "ink2_mg_f");
     mg_g_ = alloc(T * H * 4, "ink2_mg_g");
   }
-  if (use_tensor_ || mtp_) {
-    const size_t r_max = (use_tensor_ ? T : std::min<size_t>(T, 8)) * size_t(cfg_.top_k);
+  {
+    const size_t r_max = std::max<size_t>(use_tensor_ ? T : 31, 31) * size_t(cfg_.top_k);
     const size_t max_tiles = std::max<size_t>((r_max + 31) / 32 + size_t(cfg_.n_experts) + 4, size_t(cfg_.n_experts) + 4);
     moe_tiles_ = alloc(max_tiles * 3 * 4, "ink2_moe_tiles");
     moe_ntiles_ = alloc(16, "ink2_moe_ntiles");
@@ -830,8 +872,9 @@ void Inkling2::alloc_buffers() {
   att_out_ = alloc(T * QD * 4, "ink2_att_out");
   a_out_ = alloc(T * H * 4, "ink2_a_out");
   dyn_ = alloc(T * 4 * size_t(cfg_.hkv) * 4, "ink2_dyn");
+  dyn_v_ = alloc(T * 4 * size_t(cfg_.hkv) * 4, "ink2_dyn_v");
   rb_ = alloc(T * size_t(cfg_.hq) * size_t(cfg_.rel_extent) * 4, "ink2_rb");
-  const size_t attn_rows = mtp_ ? 8u : 1u;
+  const size_t attn_rows = mtp_ ? size_t(Ink2Mtp::kMaxVerifyRows) : 1u;
   part_m_ = alloc(attn_rows * size_t(cfg_.hq) * kMaxAttnChunks * 4, "ink2_part_m");
   part_l_ = alloc(attn_rows * size_t(cfg_.hq) * kMaxAttnChunks * 4, "ink2_part_l");
   part_o_ = alloc(attn_rows * size_t(cfg_.hq) * kMaxAttnChunks * size_t(cfg_.head_dim) * 4, "ink2_part_o");
@@ -848,11 +891,13 @@ void Inkling2::alloc_buffers() {
   sprob_ = alloc(64 * 4, "ink2_sprob");
   samp_ = alloc(64 * 4, "ink2_samp");
   if (mtp_) {
-    const size_t B = size_t(mtp_->block());
+    const size_t B = size_t(std::max(mtp_->block(), Ink2Mtp::kMaxVerifyRows));
     for (int i = 0; i < 3; ++i) tap_[i] = alloc(T * H * 4, "ink2_mtp_tap");
     verify_conv_ = alloc(B * conv_bytes_per_seq(cfg_), "ink2_verify_conv");
     verify_logits_ = alloc(B * V * 4, "ink2_verify_logits");
     verify_samples_ = alloc(B * 4, "ink2_verify_samples");
+    verify_accept_ = alloc(16, "ink2_verify_accept");
+    verify_tree_accept_ = alloc(sizeof(Ink2TreeAccept), "ink2_verify_tree_acc");
   }
 }
 
@@ -1048,6 +1093,19 @@ void Inkling2::enc_mm(Encoder& e, const Tensor& w, const Buffer& x, const Buffer
                       bool add, bool exact_f32) {
   const uint32_t N = N_limit ? N_limit : uint32_t(w.shape[0]);
   const uint32_t K = uint32_t(w.shape[1]);
+  if (M <= 16 && N <= 256 && (K & 3u) == 0u) {
+    for (int m0 = 0; m0 < M; m0 += 8) {
+      const uint32_t mc = uint32_t(std::min(8, M - m0));
+      const Ink2MmP p{mc, N, K, K, N, w.dtype == DType::F32 ? 1u : 0u, add ? 1u : 0u};
+      e.use(ink2_pipe("ink2_bf16_mv_smalln"));
+      e.buf(0, x.view(size_t(m0) * K * 4, size_t(mc) * K * 4));
+      e.buf(1, w.buf);
+      e.buf(2, y.view(size_t(m0) * N * 4, size_t(mc) * N * 4));
+      e.val(3, p);
+      e.dispatch(N, 1, 1, 128);
+    }
+    return;
+  }
   if (exact_f32 && M > 8 && w.dtype == DType::BF16 && (K & 127u) == 0u) {
     const Ink2MmP p{uint32_t(M), N, K, K, N, 0u, add ? 1u : 0u};
     e.use(ink2_pipe("ink2_bf16_mv8"));
@@ -1100,12 +1158,13 @@ void Inkling2::enc_mm(Encoder& e, const Tensor& w, const Buffer& x, const Buffer
 
 void Inkling2::enc_norm(Encoder& e, const Buffer& x, const Tensor* w, const Buffer& out, int T, uint32_t dim) {
   const Ink2NormP p{uint32_t(T), dim, w ? 1u : 0u, (w && w->dtype == DType::F32) ? 1u : 0u, cfg_.rms_eps};
-  e.use(ink2_pipe("ink2_rmsnorm"));
+  const Pipeline pl = ink2_pipe("ink2_rmsnorm");
+  e.use(pl);
   e.buf(0, x);
   e.buf(1, w ? w->buf : x);
   e.buf(2, out);
   e.val(3, p);
-  e.dispatch(uint32_t(T), 1, 1, 512);
+  e.dispatch(uint32_t(T), 1, 1, std::min(512u, pl.max_threads));
 }
 
 void Inkling2::enc_attn_res(Encoder& e, const Buffer* const* states, int M, const void* query_ptr, bool q_f32,
@@ -1118,12 +1177,13 @@ void Inkling2::enc_attn_res(Encoder& e, const Buffer* const* states, int M, cons
                        q_f32 ? 1u : 0u,
                        cfg_.rms_eps,
                        1.0f / std::sqrt(float(cfg_.hidden))};
-  e.use(ink2_pipe("ink2_attn_res"));
+  const Pipeline pl = ink2_pipe("ink2_attn_res");
+  e.use(pl);
   for (int m = 0; m < 6; ++m) e.buf(m, m < M ? *states[m] : *states[0]);
   e.buf(6, *static_cast<const Buffer*>(query_ptr));
   e.buf(7, out);
   e.val(8, p);
-  e.dispatch(uint32_t(T), 1, 1, 512);
+  e.dispatch(uint32_t(T), 1, 1, std::min(512u, pl.max_threads));
 }
 
 void Inkling2::enc_msg_gate(Encoder& e, const Ink2Ctrl& c, const Buffer& h, const Buffer& m, const Buffer& out, int T) {
@@ -1157,19 +1217,21 @@ void Inkling2::enc_msg_gate(Encoder& e, const Ink2Ctrl& c, const Buffer& h, cons
                        c.down->dtype == DType::F32 ? 1u : 0u, cfg_.rms_eps};
   if (T <= 16) {
     const uint32_t H = uint32_t(cfg_.hidden), R = uint32_t(cfg_.gate_rank);
-    e.use(ink2_pipe("ink2_msg_gate_prep_s"));
+    const Pipeline prep_pl = ink2_pipe("ink2_msg_gate_prep_s");
+    e.use(prep_pl);
     e.buf(0, h); e.buf(1, m); e.buf(2, mg_cat_); e.val(3, p);
-    e.dispatch(uint32_t(T), 1, 1, 512);
+    e.dispatch(uint32_t(T), 1, 1, std::min(512u, prep_pl.max_threads));
     e.use(ink2_pipe("ink2_msg_gate_down_s"));
     e.buf(0, mg_cat_); e.buf(1, c.down->buf); e.buf(2, mg_lat_); e.val(3, p);
-    e.dispatch((R + 3) / 4, (uint32_t(T) + 3) / 4, 1, 128);
+    e.dispatch(R, (uint32_t(T) + 7) / 8, 1, 128);
     e.use(ink2_pipe("ink2_msg_gate_up_mix_s"));
     e.buf(0, h); e.buf(1, m); e.buf(2, mg_lat_);
     e.buf(3, c.forget->buf); e.buf(4, c.gain->buf); e.buf(5, out); e.val(6, p);
-    e.dispatch((H + 127) / 128, (uint32_t(T) + 7) / 8, 1, 128);
+    e.dispatch((H + 63) / 64, (uint32_t(T) + 7) / 8, 1, 64);
     return;
   }
-  e.use(ink2_pipe("ink2_msg_gate"));
+  const Pipeline mg_pl = ink2_pipe("ink2_msg_gate");
+  e.use(mg_pl);
   e.buf(0, h);
   e.buf(1, m);
   e.buf(2, c.down->buf);
@@ -1177,7 +1239,7 @@ void Inkling2::enc_msg_gate(Encoder& e, const Ink2Ctrl& c, const Buffer& h, cons
   e.buf(4, c.gain->buf);
   e.buf(5, out);
   e.val(6, p);
-  e.dispatch(uint32_t(T), 1, 1, 512);
+  e.dispatch(uint32_t(T), 1, 1, std::min(512u, mg_pl.max_threads));
 }
 
 void Inkling2::enc_msg_gate3(Encoder& e, const Ink2Layer& L, const Buffer* const* in_ptrs, const Buffer& m0,
@@ -1185,35 +1247,30 @@ void Inkling2::enc_msg_gate3(Encoder& e, const Ink2Layer& L, const Buffer* const
   const Ink2Ctrl* cs[3] = {&L.ctrl_attn, &L.ctrl_k, &L.ctrl_v};
   const Buffer* ms[3] = {&m0, &m1, &m2};
   const Buffer* outs[3] = {&n0_, &n1_, &n2_};
-  if (T <= 16) {
+  if (T <= 16 && cs[0]->down->dtype == cs[1]->down->dtype && cs[0]->down->dtype == cs[2]->down->dtype) {
     const uint32_t H = uint32_t(cfg_.hidden), R = uint32_t(cfg_.gate_rank);
-    const size_t cat_sz = size_t(T) * 2 * H * 4, lat_sz = size_t(T) * R * 4;
-    e.group_begin();
-    for (int i = 0; i < 3; ++i) {
-      const Ink2MsgGateP p{uint32_t(T), H, R, cs[i]->down->dtype == DType::F32 ? 1u : 0u, cfg_.rms_eps};
-      e.use(ink2_pipe("ink2_msg_gate_prep_s"));
-      e.buf(0, *in_ptrs[i]); e.buf(1, *ms[i]); e.buf(2, mg_cat_.view(size_t(i) * cat_sz, cat_sz)); e.val(3, p);
-      e.dispatch(uint32_t(T), 1, 1, 512);
-    }
-    e.group_end();
-    e.group_begin();
-    for (int i = 0; i < 3; ++i) {
-      const Ink2MsgGateP p{uint32_t(T), H, R, cs[i]->down->dtype == DType::F32 ? 1u : 0u, cfg_.rms_eps};
-      e.use(ink2_pipe("ink2_msg_gate_down_s"));
-      e.buf(0, mg_cat_.view(size_t(i) * cat_sz, cat_sz)); e.buf(1, cs[i]->down->buf);
-      e.buf(2, mg_lat_.view(size_t(i) * lat_sz, lat_sz)); e.val(3, p);
-      e.dispatch((R + 3) / 4, (uint32_t(T) + 3) / 4, 1, 128);
-    }
-    e.group_end();
-    e.group_begin();
-    for (int i = 0; i < 3; ++i) {
-      const Ink2MsgGateP p{uint32_t(T), H, R, cs[i]->down->dtype == DType::F32 ? 1u : 0u, cfg_.rms_eps};
-      e.use(ink2_pipe("ink2_msg_gate_up_mix_s"));
-      e.buf(0, *in_ptrs[i]); e.buf(1, *ms[i]); e.buf(2, mg_lat_.view(size_t(i) * lat_sz, lat_sz));
-      e.buf(3, cs[i]->forget->buf); e.buf(4, cs[i]->gain->buf); e.buf(5, *outs[i]); e.val(6, p);
-      e.dispatch((H + 127) / 128, (uint32_t(T) + 7) / 8, 1, 128);
-    }
-    e.group_end();
+    const Ink2MsgGateP p{uint32_t(T), H, R, cs[0]->down->dtype == DType::F32 ? 1u : 0u, cfg_.rms_eps};
+    e.use(ink2_pipe("ink2_msg_gate_prep3_s"));
+    e.buf(0, *in_ptrs[0]); e.buf(1, *in_ptrs[1]); e.buf(2, *in_ptrs[2]);
+    e.buf(3, m0); e.buf(4, m1); e.buf(5, m2);
+    e.buf(6, mg_cat_); e.val(7, p);
+    e.dispatch(uint32_t(T), 3, 1, 256);
+
+    e.use(ink2_pipe("ink2_msg_gate_down3_s"));
+    e.buf(0, mg_cat_);
+    e.buf(1, cs[0]->down->buf); e.buf(2, cs[1]->down->buf); e.buf(3, cs[2]->down->buf);
+    e.buf(4, mg_lat_); e.val(5, p);
+    e.dispatch(R, (uint32_t(T) + 7) / 8, 3, 128);
+
+    e.use(ink2_pipe("ink2_msg_gate_up_mix3_s"));
+    e.buf(0, *in_ptrs[0]); e.buf(1, *in_ptrs[1]); e.buf(2, *in_ptrs[2]);
+    e.buf(3, m0); e.buf(4, m1); e.buf(5, m2);
+    e.buf(6, mg_lat_);
+    e.buf(7, cs[0]->forget->buf); e.buf(8, cs[1]->forget->buf); e.buf(9, cs[2]->forget->buf);
+    e.buf(10, cs[0]->gain->buf); e.buf(11, cs[1]->gain->buf); e.buf(12, cs[2]->gain->buf);
+    e.buf(13, n0_); e.buf(14, n1_); e.buf(15, n2_);
+    e.val(16, p);
+    e.dispatch((H + 63) / 64, (uint32_t(T) + 7) / 8, 3, 64);
     return;
   }
   const bool batched_mg = use_tensor_ && T >= 32 && cfg_.hidden <= 2560 && (cfg_.hidden & 3) == 0;
@@ -1223,15 +1280,32 @@ void Inkling2::enc_msg_gate3(Encoder& e, const Ink2Layer& L, const Buffer* const
 }
 
 void Inkling2::enc_q8_mv(Encoder& e, const Buffer& wq, const Buffer& ws, uint32_t N, uint32_t K, const Buffer& x,
-                         const Buffer& y, int M, bool add) {
+                         const Buffer& y, int M, bool add, float softcap) {
   const uint32_t nblk = K / 32u;
+  const float inv_cap = softcap > 0.0f ? (1.0f / softcap) : 0.0f;
   for (int m0 = 0; m0 < M; m0 += 8) {
     const uint32_t mc = uint32_t(std::min(8, M - m0));
-    const Ink2Q8MmP p{mc, N, K, nblk, add ? 1u : 0u};
+    const Ink2Q8MmP p{mc, N, K, nblk, add ? 1u : 0u, softcap, inv_cap};
     e.use(ink2_pipe(mc <= 4u ? "ink2_q8_mv4" : "ink2_q8_mv8"));
     e.buf(0, x.view(size_t(m0) * K * 4, size_t(mc) * K * 4));
     e.buf(1, wq);
     e.buf(2, ws);
+    e.buf(3, y.view(size_t(m0) * N * 4, size_t(mc) * N * 4));
+    e.val(4, p);
+    e.dispatch((N + 7u) / 8u, 1, 1, 128);
+  }
+}
+
+void Inkling2::enc_q4_mv(Encoder& e, const Buffer& wq, const Buffer& wsb, uint32_t N, uint32_t K, const Buffer& x,
+                         const Buffer& y, int M, bool add) {
+  const uint32_t ngrps = K / 64u;
+  for (int m0 = 0; m0 < M; m0 += 8) {
+    const uint32_t mc = uint32_t(std::min(8, M - m0));
+    const Ink2Q4MmP p{mc, N, K, ngrps, add ? 1u : 0u};
+    e.use(ink2_pipe(mc <= 4u ? "ink2_q4g64_mv4" : "ink2_q4g64_mv8"));
+    e.buf(0, x.view(size_t(m0) * K * 4, size_t(mc) * K * 4));
+    e.buf(1, wq);
+    e.buf(2, wsb);
     e.buf(3, y.view(size_t(m0) * N * 4, size_t(mc) * N * 4));
     e.val(4, p);
     e.dispatch((N + 15u) / 16u, 1, 1, 128);
@@ -1240,12 +1314,17 @@ void Inkling2::enc_q8_mv(Encoder& e, const Buffer& wq, const Buffer& ws, uint32_
 
 void Inkling2::enc_unembed(Encoder& e, const Buffer& x, const Buffer& y, int M, bool apply_softcap) {
   const uint32_t V = uint32_t(cfg_.vocab);
-  if (M <= 8 && unembed_q_) {
-    enc_q8_mv(e, unembed_q_, unembed_s_, V, uint32_t(cfg_.hidden), x, y, M, false);
+  bool softcap_done = false;
+  if (M <= 16 && unembed_q4_) {
+    enc_q4_mv(e, unembed_q4_, unembed_sb_, V, uint32_t(cfg_.hidden), x, y, M, false);
+  } else if (M <= 16 && unembed_q_) {
+    enc_q8_mv(e, unembed_q_, unembed_s_, V, uint32_t(cfg_.hidden), x, y, M, false,
+              apply_softcap ? cfg_.logit_softcap : 0.0f);
+    softcap_done = true;
   } else {
     enc_mm(e, *unembed_, x, y, M, V, false);
   }
-  if (apply_softcap) {
+  if (apply_softcap && !softcap_done) {
     const Ink2SoftcapP sp{uint32_t(M) * V, cfg_.logit_softcap, 1.0f / cfg_.logit_softcap};
     e.use(ink2_pipe("ink2_softcap"));
     e.buf(0, y);
@@ -1255,7 +1334,8 @@ void Inkling2::enc_unembed(Encoder& e, const Buffer& x, const Buffer& y, int M, 
 }
 
 void Inkling2::enc_forward(Encoder& e, Seq& s, int pos0, int T, bool dump_logits, const Buffer* out_logits,
-                           bool need_all_logits, const Buffer* diag_rows, bool capture_taps, bool save_conv_snaps) {
+                           bool need_all_logits, const Buffer* diag_rows, bool capture_taps, bool save_conv_snaps,
+                           const Buffer* tree_buf) {
   Ink2Grouped gp(e, true);
   const uint32_t H = uint32_t(cfg_.hidden);
   const uint32_t QD = uint32_t(cfg_.hq) * uint32_t(cfg_.head_dim);
@@ -1270,13 +1350,14 @@ void Inkling2::enc_forward(Encoder& e, Seq& s, int pos0, int T, bool dump_logits
   // Embed + norm -> x_
   {
     const Ink2EmbedP ep{uint32_t(T), H, uint32_t(pos0), uint32_t(embed_->shape[0]), cfg_.rms_eps};
-    e.use(ink2_pipe("ink2_embed_norm"));
+    const Pipeline embed_pl = ink2_pipe("ink2_embed_norm");
+    e.use(embed_pl);
     e.buf(0, s.tok);
     e.buf(1, embed_->buf);
     e.buf(2, embed_norm_->buf);
     e.buf(3, x_);
     e.val(4, ep);
-    e.dispatch(uint32_t(T), 1, 1, 512);
+    e.dispatch(uint32_t(T), 1, 1, std::min(512u, embed_pl.max_threads));
   }
   if (diag_rows) enc_copy_buf(e, x_.view(size_t(T - 1) * H * 4, H * 4), diag_rows->view(0, H * 4), H * 4);
 
@@ -1315,6 +1396,16 @@ void Inkling2::enc_forward(Encoder& e, Seq& s, int pos0, int T, bool dump_logits
         blocks_vec.clear();
         for (int b = 0; b < n_prelude_blocks; ++b) blocks_vec.push_back(&prelude_blocks_[b]);
         have_prev = true;
+        if (T <= 16) {
+          const Ink2AttnResP mp{uint32_t(T), H, 2u, 4u, 1u, cfg_.rms_eps, 1.0f / std::sqrt(float(H))};
+          e.use(ink2_pipe("ink2_attn_res_pass"));
+          e.buf(0, blocks_[4]);
+          e.buf(1, blocks_[5]);
+          e.buf(2, msg_queries_);
+          e.buf(3, pass_msg_out_);
+          e.val(4, mp);
+          e.dispatch(uint32_t(T), uint32_t(cfg_.core_end - cfg_.core_start), 1, 256);
+        }
       }
     }
 
@@ -1325,11 +1416,13 @@ void Inkling2::enc_forward(Encoder& e, Seq& s, int pos0, int T, bool dump_logits
     }
 
     const bool has_msgs = have_prev && ip < cfg_.core_end;
-    const Buffer msg0 = msg_out_.view(0 * row_bytes, row_bytes);
-    const Buffer msg1 = msg_out_.view(1 * row_bytes, row_bytes);
-    const Buffer msg2 = msg_out_.view(2 * row_bytes, row_bytes);
-    const Buffer msg3 = msg_out_.view(3 * row_bytes, row_bytes);
-    if (has_msgs) {
+    const Buffer& msg_src = (has_msgs && T <= 16) ? pass_msg_out_ : msg_out_;
+    const size_t msg_base = (has_msgs && T <= 16) ? size_t(ip - cfg_.core_start) * 4u * row_bytes : 0u;
+    const Buffer msg0 = msg_src.view(msg_base + 0 * row_bytes, row_bytes);
+    const Buffer msg1 = msg_src.view(msg_base + 1 * row_bytes, row_bytes);
+    const Buffer msg2 = msg_src.view(msg_base + 2 * row_bytes, row_bytes);
+    const Buffer msg3 = msg_src.view(msg_base + 3 * row_bytes, row_bytes);
+    if (has_msgs && T > 16) {
       const Buffer* bank_states[2] = {&blocks_[4], &blocks_[5]};
       const Buffer qv = msg_queries_.view(size_t(ip - cfg_.core_start) * 4 * H * 4, 4 * H * 4);
       enc_attn_res(e, bank_states, 2, &qv, true, 4, msg_out_, T);
@@ -1359,17 +1452,23 @@ void Inkling2::enc_forward(Encoder& e, Seq& s, int pos0, int T, bool dump_logits
 
     if (has_msgs) {
       enc_msg_gate3(e, L, in_ptrs, msg0, msg1, msg2, T);
-      e.group_begin();
-      if (L.is_swa) {
-        enc_norm(e, n0_, L.attn_norm, n0_, T, H);
-        enc_norm(e, n1_, L.attn_norm, n1_, T, H);
-        enc_norm(e, n2_, L.attn_norm, n2_, T, H);
+      const Tensor* w0 = L.is_swa ? L.attn_norm : L.q_norm;
+      const Tensor* w1 = L.is_swa ? L.attn_norm : L.k_norm;
+      const Tensor* w2 = L.is_swa ? L.attn_norm : L.v_norm;
+      if (w0->dtype == w1->dtype && w0->dtype == w2->dtype) {
+        const Ink2NormP np{uint32_t(T), H, 1u, w0->dtype == DType::F32 ? 1u : 0u, cfg_.rms_eps};
+        e.use(ink2_pipe("ink2_rmsnorm3"));
+        e.buf(0, n0_); e.buf(1, n1_); e.buf(2, n2_);
+        e.buf(3, w0->buf); e.buf(4, w1->buf); e.buf(5, w2->buf);
+        e.val(6, np);
+        e.dispatch(uint32_t(T), 3, 1, 256);
       } else {
-        enc_norm(e, n0_, L.q_norm, n0_, T, H);
-        enc_norm(e, n1_, L.k_norm, n1_, T, H);
-        enc_norm(e, n2_, L.v_norm, n2_, T, H);
+        e.group_begin();
+        enc_norm(e, n0_, w0, n0_, T, H);
+        enc_norm(e, n1_, w1, n1_, T, H);
+        enc_norm(e, n2_, w2, n2_, T, H);
+        e.group_end();
       }
-      e.group_end();
     } else if (L.is_swa) {
       enc_norm(e, *in_ptrs[0], L.attn_norm, n0_, T, H);
     } else {
@@ -1383,42 +1482,49 @@ void Inkling2::enc_forward(Encoder& e, Seq& s, int pos0, int T, bool dump_logits
     const Buffer& kn = (has_msgs || !L.is_swa) ? n1_ : n0_;
     const Buffer& vn = (has_msgs || !L.is_swa) ? n2_ : n0_;
 
-    const bool pf_sconv_kv = L.is_swa && T >= 16 && !save_conv_snaps && KVD <= H;
-    if (L.qkvrsg_q && T <= 8 && (H & 255u) == 0u) {
-      Ink2Q8Multi6P mp{uint32_t(T), H, L.qkvrsg_offs[6], 6u, H / 32u, {}, {}};
-      for (uint32_t i = 0; i < 7u; ++i) mp.offs[i] = L.qkvrsg_offs[i];
-      for (uint32_t i = 0; i < 6u; ++i) mp.lens[i] = L.qkvrsg_lens[i];
-      e.use(ink2_pipe(T <= 4 ? "ink2_q8_mv4_multi6" : "ink2_q8_mv8_multi6"));
-      e.buf(0, n0_);
-      e.buf(1, kn);
-      e.buf(2, vn);
-      e.buf(3, L.qkvrsg_q);
-      e.buf(4, L.qkvrsg_s);
-      e.buf(5, q_);
-      e.buf(6, r_);
-      e.buf(7, sinks_);
-      e.buf(8, gate_attn_);
-      e.buf(9, k_);
-      e.buf(10, v_);
-      e.val(11, mp);
-      e.dispatch((mp.N_tot + 15) / 16, 1, 1, 128);
-    } else if (L.qkvrsg_w && T <= 8 && (H & 7u) == 0u) {
-      Ink2MultiMmP mp{uint32_t(T), H, L.qkvrsg_offs[6], 6u, {}, {}};
-      for (uint32_t i = 0; i < 7u; ++i) mp.offs[i] = L.qkvrsg_offs[i];
-      for (uint32_t i = 0; i < 6u; ++i) mp.lens[i] = L.qkvrsg_lens[i];
-      e.use(ink2_pipe(T <= 4 ? "ink2_bf16_mv4_multi6" : "ink2_bf16_mv8_multi6"));
-      e.buf(0, n0_);
-      e.buf(1, kn);
-      e.buf(2, vn);
-      e.buf(3, L.qkvrsg_w);
-      e.buf(4, q_);
-      e.buf(5, r_);
-      e.buf(6, sinks_);
-      e.buf(7, gate_attn_);
-      e.buf(8, k_);
-      e.buf(9, v_);
-      e.val(10, mp);
-      e.dispatch((mp.N_tot + 15) / 16, 1, 1, 128);
+    const bool pf_sconv_kv = L.is_swa && T >= 16 && !save_conv_snaps && !tree_buf && KVD <= H;
+    const uint32_t HQDREL = uint32_t(cfg_.hq) * uint32_t(cfg_.d_rel);
+    if (L.qkvrsg_q && T <= 16 && (H & 255u) == 0u) {
+      for (int m0 = 0; m0 < T; m0 += 8) {
+        const uint32_t mc = uint32_t(std::min(8, T - m0));
+        Ink2Q8Multi6P mp{mc, H, L.qkvrsg_offs[6], 6u, H / 32u, {}, {}};
+        for (uint32_t i = 0; i < 7u; ++i) mp.offs[i] = L.qkvrsg_offs[i];
+        for (uint32_t i = 0; i < 6u; ++i) mp.lens[i] = L.qkvrsg_lens[i];
+        e.use(ink2_pipe(mc <= 4u ? "ink2_q8_mv4_multi6" : "ink2_q8_mv8_multi6"));
+        e.buf(0, n0_.view(size_t(m0) * H * 4, size_t(mc) * H * 4));
+        e.buf(1, kn.view(size_t(m0) * H * 4, size_t(mc) * H * 4));
+        e.buf(2, vn.view(size_t(m0) * H * 4, size_t(mc) * H * 4));
+        e.buf(3, L.qkvrsg_q);
+        e.buf(4, L.qkvrsg_s);
+        e.buf(5, q_.view(size_t(m0) * QD * 4, size_t(mc) * QD * 4));
+        e.buf(6, r_.view(size_t(m0) * HQDREL * 4, size_t(mc) * HQDREL * 4));
+        e.buf(7, sinks_.view(size_t(m0) * uint32_t(cfg_.hq) * 4, size_t(mc) * uint32_t(cfg_.hq) * 4));
+        e.buf(8, gate_attn_.view(size_t(m0) * QD * 4, size_t(mc) * QD * 4));
+        e.buf(9, k_.view(size_t(m0) * KVD * 4, size_t(mc) * KVD * 4));
+        e.buf(10, v_.view(size_t(m0) * KVD * 4, size_t(mc) * KVD * 4));
+        e.val(11, mp);
+        e.dispatch((mp.N_tot + 7u) / 8u, 1, 1, 128);
+      }
+    } else if (L.qkvrsg_w && T <= 16 && (H & 7u) == 0u) {
+      for (int m0 = 0; m0 < T; m0 += 8) {
+        const uint32_t mc = uint32_t(std::min(8, T - m0));
+        Ink2MultiMmP mp{mc, H, L.qkvrsg_offs[6], 6u, {}, {}};
+        for (uint32_t i = 0; i < 7u; ++i) mp.offs[i] = L.qkvrsg_offs[i];
+        for (uint32_t i = 0; i < 6u; ++i) mp.lens[i] = L.qkvrsg_lens[i];
+        e.use(ink2_pipe(mc <= 4u ? "ink2_bf16_mv4_multi6" : "ink2_bf16_mv8_multi6"));
+        e.buf(0, n0_.view(size_t(m0) * H * 4, size_t(mc) * H * 4));
+        e.buf(1, kn.view(size_t(m0) * H * 4, size_t(mc) * H * 4));
+        e.buf(2, vn.view(size_t(m0) * H * 4, size_t(mc) * H * 4));
+        e.buf(3, L.qkvrsg_w);
+        e.buf(4, q_.view(size_t(m0) * QD * 4, size_t(mc) * QD * 4));
+        e.buf(5, r_.view(size_t(m0) * HQDREL * 4, size_t(mc) * HQDREL * 4));
+        e.buf(6, sinks_.view(size_t(m0) * uint32_t(cfg_.hq) * 4, size_t(mc) * uint32_t(cfg_.hq) * 4));
+        e.buf(7, gate_attn_.view(size_t(m0) * QD * 4, size_t(mc) * QD * 4));
+        e.buf(8, k_.view(size_t(m0) * KVD * 4, size_t(mc) * KVD * 4));
+        e.buf(9, v_.view(size_t(m0) * KVD * 4, size_t(mc) * KVD * 4));
+        e.val(10, mp);
+        e.dispatch((mp.N_tot + 15) / 16, 1, 1, 128);
+      }
     } else {
       e.group_begin();
       enc_mm(e, *L.wq_du, n0_, q_, T);
@@ -1465,7 +1571,7 @@ void Inkling2::enc_forward(Encoder& e, Seq& s, int pos0, int T, bool dump_logits
         e.group_begin();
         const Ink2SconvStaticP sp{uint32_t(T), KVD, L.k_sconv->dtype == DType::F32 ? 1u : 0u, save_snap_flag,
                                   snap_stride, 0u, sconv_static_scale};
-        e.use(ink2_pipe("ink2_sconv_static"));
+        e.use(ink2_pipe(tree_buf ? "ink2_sconv_static_tree" : "ink2_sconv_static"));
         e.buf(0, k_);
         e.buf(1, L.k_sconv->buf);
         e.buf(2, conv_k);
@@ -1473,11 +1579,12 @@ void Inkling2::enc_forward(Encoder& e, Seq& s, int pos0, int T, bool dump_logits
         e.val(4, sp);
         e.buf(5, save_conv_snaps ? verify_conv_.view(cbase, verify_conv_.size - cbase) : conv_k);
         e.buf(6, k_);
+        if (tree_buf) e.buf(7, *tree_buf);
         e.dispatch((KVD + 255) / 256, 1, 1, 256);
 
         const Ink2SconvStaticP svp{uint32_t(T), KVD, L.v_sconv->dtype == DType::F32 ? 1u : 0u, save_snap_flag,
                                    snap_stride, 0u, sconv_static_scale};
-        e.use(ink2_pipe("ink2_sconv_static"));
+        e.use(ink2_pipe(tree_buf ? "ink2_sconv_static_tree" : "ink2_sconv_static"));
         e.buf(0, v_);
         e.buf(1, L.v_sconv->buf);
         e.buf(2, conv_v);
@@ -1486,14 +1593,20 @@ void Inkling2::enc_forward(Encoder& e, Seq& s, int pos0, int T, bool dump_logits
         e.buf(5, save_conv_snaps ? verify_conv_.view(cbase + 3 * KVD * 4, verify_conv_.size - (cbase + 3 * KVD * 4))
                                  : conv_v);
         e.buf(6, v_);
+        if (tree_buf) e.buf(7, *tree_buf);
         e.dispatch((KVD + 255) / 256, 1, 1, 256);
         e.group_end();
       }
     } else {
+      e.group_begin();
       enc_mm(e, *L.k_proj, kn, dyn_, T);
+      enc_mm(e, *L.v_proj, vn, dyn_v_, T);
+      e.group_end();
+
+      e.group_begin();
       const Ink2SconvDynP dp{uint32_t(T), KVD, uint32_t(cfg_.hkv), L.k_static->dtype == DType::F32 ? 1u : 0u,
                              save_snap_flag, snap_stride};
-      e.use(ink2_pipe("ink2_sconv_dynamic"));
+      e.use(ink2_pipe(tree_buf ? "ink2_sconv_dynamic_tree" : "ink2_sconv_dynamic"));
       e.buf(0, k_);
       e.buf(1, dyn_);
       e.buf(2, L.k_static->buf);
@@ -1501,21 +1614,23 @@ void Inkling2::enc_forward(Encoder& e, Seq& s, int pos0, int T, bool dump_logits
       e.buf(4, k_);
       e.val(5, dp);
       e.buf(6, save_conv_snaps ? verify_conv_.view(cbase, verify_conv_.size - cbase) : conv_k);
+      if (tree_buf) e.buf(7, *tree_buf);
       e.dispatch((KVD + 255) / 256, 1, 1, 256);
 
-      enc_mm(e, *L.v_proj, vn, dyn_, T);
       const Ink2SconvDynP dvp{uint32_t(T), KVD, uint32_t(cfg_.hkv), L.v_static->dtype == DType::F32 ? 1u : 0u,
                               save_snap_flag, snap_stride};
-      e.use(ink2_pipe("ink2_sconv_dynamic"));
+      e.use(ink2_pipe(tree_buf ? "ink2_sconv_dynamic_tree" : "ink2_sconv_dynamic"));
       e.buf(0, v_);
-      e.buf(1, dyn_);
+      e.buf(1, dyn_v_);
       e.buf(2, L.v_static->buf);
       e.buf(3, conv_v);
       e.buf(4, v_);
       e.val(5, dvp);
       e.buf(6, save_conv_snaps ? verify_conv_.view(cbase + 3 * KVD * 4, verify_conv_.size - (cbase + 3 * KVD * 4))
                                : conv_v);
+      if (tree_buf) e.buf(7, *tree_buf);
       e.dispatch((KVD + 255) / 256, 1, 1, 256);
+      e.group_end();
     }
 
     // Q/K/R clipping + V norm + log scaling + KV cache write
@@ -1537,7 +1652,7 @@ void Inkling2::enc_forward(Encoder& e, Seq& s, int pos0, int T, bool dump_logits
                          cfg_.log_floor,
                          cfg_.log_alpha,
                          kv_fp8_flag};
-      e.use(ink2_pipe("ink2_qkvr_prep"));
+      e.use(ink2_pipe(tree_buf ? "ink2_qkvr_prep_tree" : "ink2_qkvr_prep"));
       e.buf(0, q_);
       e.buf(1, k_);
       e.buf(2, v_);
@@ -1547,6 +1662,7 @@ void Inkling2::enc_forward(Encoder& e, Seq& s, int pos0, int T, bool dump_logits
       e.buf(6, s.kc[v_idx]);
       e.buf(7, s.vc[v_idx]);
       e.val(8, qp);
+      if (tree_buf) e.buf(9, *tree_buf);
       e.dispatch(uint32_t(2 * cfg_.hq + 2 * cfg_.hkv), uint32_t(T), 1, uint32_t(cfg_.head_dim));
     }
 
@@ -1554,28 +1670,31 @@ void Inkling2::enc_forward(Encoder& e, Seq& s, int pos0, int T, bool dump_logits
     {
       const Ink2RelP rp{uint32_t(T), uint32_t(cfg_.hq), uint32_t(cfg_.d_rel), uint32_t(cfg_.rel_extent),
                         L.rel_proj->dtype == DType::F32 ? 1u : 0u};
+      const uint32_t active_ext = std::min(uint32_t(cfg_.rel_extent), uint32_t(pos0 + T));
       if (cfg_.d_rel == 16 && T >= 8) {
         e.use(ink2_pipe("ink2_rel_bias_pf"));
         e.buf(0, r_);
         e.buf(1, L.rel_proj->buf);
         e.buf(2, rb_);
         e.val(3, rp);
-        e.dispatch((uint32_t(cfg_.rel_extent) + 31) / 32, (uint32_t(T) + 7) / 8, (uint32_t(cfg_.hq) + 7) / 8, 128);
+        e.dispatch((active_ext + 31) / 32, (uint32_t(T) + 7) / 8, (uint32_t(cfg_.hq) + 7) / 8, 128);
       } else {
         e.use(ink2_pipe("ink2_rel_bias"));
         e.buf(0, r_);
         e.buf(1, L.rel_proj->buf);
         e.buf(2, rb_);
         e.val(3, rp);
-        e.dispatch((uint32_t(cfg_.rel_extent) + 31) / 32, uint32_t(cfg_.hq), uint32_t(T), 32);
+        e.dispatch((active_ext + 31) / 32, uint32_t(cfg_.hq), uint32_t(T), 32);
       }
     }
 
     // Attention
     const float attn_scale = 1.0f / std::sqrt(float(cfg_.head_dim));
-    if (T == 1) {
+    const bool use_gqa = (cfg_.hq == cfg_.hkv * 3 && cfg_.head_dim == 128);
+    if (T == 1 && !tree_buf) {
       const uint32_t lk = L.is_swa ? std::min(uint32_t(pos0 + 1), uint32_t(cfg_.swa)) : uint32_t(pos0 + 1);
-      uint32_t chunk = std::max(32u, (lk + kMaxAttnChunks - 1) / kMaxAttnChunks);
+      uint32_t chunk =
+          (use_gqa && lk <= 32u) ? lk : std::max(use_gqa ? 16u : 32u, (lk + kMaxAttnChunks - 1) / kMaxAttnChunks);
       chunk = (chunk + 3) / 4 * 4;
       const uint32_t nchunks = std::max(1u, (lk + chunk - 1) / chunk);
       const Ink2AttnDecP adp{uint32_t(pos0),
@@ -1591,7 +1710,11 @@ void Inkling2::enc_forward(Encoder& e, Seq& s, int pos0, int T, bool dump_logits
                              attn_scale,
                              kv_fp8_flag};
       if (nchunks == 1u) {
-        e.use(ink2_pipe("ink2_attn_decode_1pass"));
+        if (use_gqa) {
+          e.use(ink2_pipe(L.is_swa ? "ink2_attn_decode_1pass_gqa_swa" : "ink2_attn_decode_1pass_gqa_global"));
+        } else {
+          e.use(ink2_pipe("ink2_attn_decode_1pass"));
+        }
         e.buf(0, q_);
         e.buf(1, s.kc[v_idx]);
         e.buf(2, s.vc[v_idx]);
@@ -1600,9 +1723,13 @@ void Inkling2::enc_forward(Encoder& e, Seq& s, int pos0, int T, bool dump_logits
         e.buf(5, gate_attn_);
         e.buf(6, att_out_);
         e.val(7, adp);
-        e.dispatch(uint32_t(cfg_.hq), 1, 1, 128);
+        e.dispatch(use_gqa ? uint32_t(cfg_.hkv) : uint32_t(cfg_.hq), 1, 1, 128);
       } else {
-        e.use(ink2_pipe("ink2_attn_decode"));
+        if (use_gqa) {
+          e.use(ink2_pipe(L.is_swa ? "ink2_attn_decode_gqa_swa" : "ink2_attn_decode_gqa_global"));
+        } else {
+          e.use(ink2_pipe("ink2_attn_decode"));
+        }
         e.buf(0, q_);
         e.buf(1, s.kc[v_idx]);
         e.buf(2, s.vc[v_idx]);
@@ -1611,7 +1738,7 @@ void Inkling2::enc_forward(Encoder& e, Seq& s, int pos0, int T, bool dump_logits
         e.buf(5, part_l_);
         e.buf(6, part_o_);
         e.val(7, adp);
-        e.dispatch(uint32_t(cfg_.hq), nchunks, 1, 128);
+        e.dispatch(use_gqa ? uint32_t(cfg_.hkv) : uint32_t(cfg_.hq), nchunks, 1, 128);
 
         e.use(ink2_pipe("ink2_attn_decode_reduce"));
         e.buf(0, part_m_);
@@ -1623,10 +1750,11 @@ void Inkling2::enc_forward(Encoder& e, Seq& s, int pos0, int T, bool dump_logits
         e.val(6, adp);
         e.dispatch(uint32_t(cfg_.hq), 1, 1, 32);
       }
-    } else if (T >= 2 && T <= 8 && (pos0 + T) >= 64) {
+    } else if ((tree_buf && use_gqa && T <= 16) ||
+               ((use_gqa ? (T >= 2 && T <= 16) : (T >= 2 && T <= 8)) && (pos0 + T) >= 64)) {
       const uint32_t k_min = (L.is_swa && pos0 + 1 > cfg_.swa) ? uint32_t(pos0 + 1 - cfg_.swa) : 0u;
       const uint32_t lk = uint32_t(pos0 + T) - k_min;
-      uint32_t chunk = std::max(32u, (lk + kMaxAttnChunks - 1) / kMaxAttnChunks);
+      uint32_t chunk = std::max(use_gqa ? 16u : 32u, (lk + kMaxAttnChunks - 1) / kMaxAttnChunks);
       chunk = (chunk + 3) / 4 * 4;
       const uint32_t nchunks = std::max(1u, (lk + chunk - 1) / chunk);
       const Ink2AttnVerP avp{uint32_t(T),
@@ -1642,16 +1770,30 @@ void Inkling2::enc_forward(Encoder& e, Seq& s, int pos0, int T, bool dump_logits
                              nchunks,
                              attn_scale,
                              kv_fp8_flag};
-      e.use(ink2_pipe(T == 2 ? "ink2_attn_verify2" : "ink2_attn_verify"));
-      e.buf(0, q_);
-      e.buf(1, s.kc[v_idx]);
-      e.buf(2, s.vc[v_idx]);
-      e.buf(3, rb_);
-      e.buf(4, part_m_);
-      e.buf(5, part_l_);
-      e.buf(6, part_o_);
-      e.val(7, avp);
-      e.dispatch(uint32_t(cfg_.hq), nchunks, 1, 128);
+      if (use_gqa) {
+        e.use(ink2_pipe(tree_buf ? "ink2_attn_verify_tree_gqa" : "ink2_attn_verify_gqa"));
+        e.buf(0, q_);
+        e.buf(1, s.kc[v_idx]);
+        e.buf(2, s.vc[v_idx]);
+        e.buf(3, rb_);
+        e.buf(4, part_m_);
+        e.buf(5, part_l_);
+        e.buf(6, part_o_);
+        e.val(7, avp);
+        if (tree_buf) e.buf(8, *tree_buf);
+        e.dispatch(uint32_t(cfg_.hkv), nchunks, (uint32_t(T) + 3u) / 4u, 192);
+      } else {
+        e.use(ink2_pipe(T == 2 ? "ink2_attn_verify2" : "ink2_attn_verify"));
+        e.buf(0, q_);
+        e.buf(1, s.kc[v_idx]);
+        e.buf(2, s.vc[v_idx]);
+        e.buf(3, rb_);
+        e.buf(4, part_m_);
+        e.buf(5, part_l_);
+        e.buf(6, part_o_);
+        e.val(7, avp);
+        e.dispatch(uint32_t(cfg_.hq), nchunks, 1, 128);
+      }
 
       e.use(ink2_pipe("ink2_attn_verify_reduce"));
       e.buf(0, part_m_);
@@ -1689,10 +1831,10 @@ void Inkling2::enc_forward(Encoder& e, Seq& s, int pos0, int T, bool dump_logits
     }
 
     // wo_ud + attn_sconv (+ *cur_x residual on non-boundary layers -> ffn_inp_)
-    if (L.wo_q && T <= 8) enc_q8_mv(e, L.wo_q, L.wo_s, H, QD, att_out_, a_out_, T);
+    if (L.wo_q && T <= 16) enc_q8_mv(e, L.wo_q, L.wo_s, H, QD, att_out_, a_out_, T);
     else enc_mm(e, *L.wo_ud, att_out_, a_out_, T);
     const bool is_boundary = (ip % cfg_.block_sz == 0);
-    if (T >= 16 && !save_conv_snaps) {
+    if (T >= 16 && !save_conv_snaps && !tree_buf) {
       const Ink2SconvStaticP asp{uint32_t(T), H, L.attn_sconv->dtype == DType::F32 ? 1u : 0u, 0u, 0u,
                                  is_boundary ? 0u : 1u, sconv_static_scale};
       e.use(ink2_pipe("ink2_sconv_static_pf"));
@@ -1707,7 +1849,7 @@ void Inkling2::enc_forward(Encoder& e, Seq& s, int pos0, int T, bool dump_logits
     } else {
       const Ink2SconvStaticP asp{uint32_t(T), H, L.attn_sconv->dtype == DType::F32 ? 1u : 0u, save_snap_flag,
                                  snap_stride, is_boundary ? 0u : 1u, sconv_static_scale};
-      e.use(ink2_pipe("ink2_sconv_static"));
+      e.use(ink2_pipe(tree_buf ? "ink2_sconv_static_tree" : "ink2_sconv_static"));
       e.buf(0, a_out_);
       e.buf(1, L.attn_sconv->buf);
       e.buf(2, conv_a);
@@ -1716,6 +1858,7 @@ void Inkling2::enc_forward(Encoder& e, Seq& s, int pos0, int T, bool dump_logits
       e.buf(5, save_conv_snaps ? verify_conv_.view(cbase + 6 * KVD * 4, verify_conv_.size - (cbase + 6 * KVD * 4))
                                : conv_a);
       e.buf(6, *cur_x);
+      if (tree_buf) e.buf(7, *tree_buf);
       e.dispatch((H + 255) / 256, 1, 1, 256);
     }
     if (is_boundary) {
@@ -1796,7 +1939,7 @@ void Inkling2::enc_forward(Encoder& e, Seq& s, int pos0, int T, bool dump_logits
         e.buf(1, moe_out_);
         e.val(2, mp);
         e.dispatch(((H / 4) + 63) / 64, uint32_t(T), 1, 64);
-      } else if (T >= 3 && T <= 8 && moe_tiles_) {
+      } else if (T >= 2 && T <= 31 && moe_tiles_) {
         const struct {
           uint32_t T, K_top, E;
         } bp{uint32_t(T), uint32_t(cfg_.top_k), uint32_t(cfg_.n_experts)};
@@ -1824,7 +1967,7 @@ void Inkling2::enc_forward(Encoder& e, Seq& s, int pos0, int T, bool dump_logits
           e.buf(7, moe_st_pair_);
           e.buf(8, moe_act_);
           e.val(9, mp);
-          e.dispatch((uint32_t(cfg_.moe_I) + 7) / 8, max_e, 1, 128);
+          e.dispatch((uint32_t(cfg_.moe_I) + 15) / 16, max_e, 1, 128);
 
           e.use(ink2_pipe("ink2_moe_nvfp4_w2_g"));
           e.buf(0, moe_act_);
@@ -1849,7 +1992,7 @@ void Inkling2::enc_forward(Encoder& e, Seq& s, int pos0, int T, bool dump_logits
           e.buf(6, moe_st_pair_);
           e.buf(7, moe_act_);
           e.val(8, mp);
-          e.dispatch((uint32_t(cfg_.moe_I) + 7) / 8, max_e, 1, 128);
+          e.dispatch((uint32_t(cfg_.moe_I) + 15) / 16, max_e, 1, 128);
 
           e.use(ink2_pipe("ink2_moe_mxfp8_w2_g"));
           e.buf(0, moe_act_);
@@ -1861,7 +2004,7 @@ void Inkling2::enc_forward(Encoder& e, Seq& s, int pos0, int T, bool dump_logits
           e.buf(6, moe_st_ew_);
           e.buf(7, moe_pair_out_);
           e.val(8, mp);
-          e.dispatch((H + 15) / 16, max_e, 1, 128);
+          e.dispatch((H + 31) / 32, max_e, 1, 128);
         }
 
         e.use(ink2_pipe("ink2_moe_reduce8_m3"));
@@ -1889,7 +2032,7 @@ void Inkling2::enc_forward(Encoder& e, Seq& s, int pos0, int T, bool dump_logits
         e.buf(5, L.w2_outer);
         e.buf(6, moe_out_);
         e.val(7, mp);
-        e.dispatch((H + 15) / 16, uint32_t(T), 1, 128);
+        e.dispatch((H + 7u) / 8u, uint32_t(T), 1, 128);
       } else {
         e.use(ink2_pipe("ink2_moe_mxfp8_w13_situ"));
         e.buf(0, x_mlp_);
@@ -1898,7 +2041,7 @@ void Inkling2::enc_forward(Encoder& e, Seq& s, int pos0, int T, bool dump_logits
         e.buf(3, L.w13_sc->buf);
         e.buf(4, moe_act_);
         e.val(5, mp);
-        e.dispatch((uint32_t(cfg_.moe_I) + 7) / 8, uint32_t(cfg_.top_k), uint32_t(T), 128);
+        e.dispatch((uint32_t(cfg_.moe_I) + 15) / 16, uint32_t(cfg_.top_k), uint32_t(T), 128);
 
         e.use(ink2_pipe("ink2_moe_mxfp8_w2_acc"));
         e.buf(0, moe_act_);
@@ -1913,7 +2056,7 @@ void Inkling2::enc_forward(Encoder& e, Seq& s, int pos0, int T, bool dump_logits
     }
 
     // mlp_sconv + residual add -> *alt_x, then swap(cur_x, alt_x)
-    if (T >= 16 && !save_conv_snaps) {
+    if (T >= 16 && !save_conv_snaps && !tree_buf) {
       const Ink2SconvStaticP msp{uint32_t(T), H, L.mlp_sconv->dtype == DType::F32 ? 1u : 0u, 0u, 0u, 1u,
                                  sconv_static_scale};
       e.use(ink2_pipe("ink2_sconv_static_pf"));
@@ -1928,7 +2071,7 @@ void Inkling2::enc_forward(Encoder& e, Seq& s, int pos0, int T, bool dump_logits
     } else {
       const Ink2SconvStaticP msp{uint32_t(T), H, L.mlp_sconv->dtype == DType::F32 ? 1u : 0u, save_snap_flag,
                                  snap_stride, 1u, sconv_static_scale};
-      e.use(ink2_pipe("ink2_sconv_static"));
+      e.use(ink2_pipe(tree_buf ? "ink2_sconv_static_tree" : "ink2_sconv_static"));
       e.buf(0, moe_out_);
       e.buf(1, L.mlp_sconv->buf);
       e.buf(2, conv_m);
@@ -1938,6 +2081,7 @@ void Inkling2::enc_forward(Encoder& e, Seq& s, int pos0, int T, bool dump_logits
                    ? verify_conv_.view(cbase + 6 * KVD * 4 + 3 * H * 4, verify_conv_.size - (cbase + 6 * KVD * 4 + 3 * H * 4))
                    : conv_m);
       e.buf(6, ffn_inp_);
+      if (tree_buf) e.buf(7, *tree_buf);
       e.dispatch((H + 255) / 256, 1, 1, 256);
     }
     std::swap(cur_x, alt_x);
@@ -2029,11 +2173,69 @@ void Inkling2::encode_mtp_draft(Encoder& e, Seq& s, int P, int K, const Sampling
   mtp_->encode_draft(e, s, P, K, sp, step);
 }
 
-void Inkling2::encode_mtp_verify(Encoder& e, Seq& s, int P, int R, const SamplingParams& sp, uint32_t step) {
+void Inkling2::encode_mtp_verify(Encoder& e, Seq& s, int P, int R, const SamplingParams& sp, uint32_t step,
+                                 bool point_mass) {
   if (!mtp_) fatal("inkling2: MTP drafter not loaded");
-  if (R < 1 || R > mtp_->block()) fatal("inkling2: verify rows %d out of range", R);
+  const int max_r = point_mass ? Ink2Mtp::kMaxVerifyRows : mtp_->block();
+  if (R < 1 || R > max_r) fatal("inkling2: verify rows %d out of range", R);
   if (P + R >= s.cap) fatal("context full (%d)", s.cap);
   enc_forward(e, s, P, R, true, &verify_logits_, true, nullptr, true, true);
+  enc_logit_mask(e, s, verify_logits_, R, cfg_.vocab, cfg_.vocab);
+  const uint32_t V = uint32_t(cfg_.vocab);
+  if (sp.temperature <= 0.0f) {
+    last_gpu_accept_ = false;
+    const struct {
+      uint32_t V;
+    } ap{V};
+    e.use(ink2_pipe("ink2_mtp_argmax_stage1"));
+    e.buf(0, verify_logits_);
+    e.buf(1, cand_v_);
+    e.buf(2, cand_i_);
+    e.val(3, ap);
+    e.dispatch(64, uint32_t(R), 1, 256);
+
+    e.use(ink2_pipe("ink2_mtp_argmax_stage2"));
+    e.buf(0, cand_v_);
+    e.buf(1, cand_i_);
+    e.buf(2, verify_samples_);
+    e.dispatch(uint32_t(R), 1, 1, 64);
+  } else if (Ink2Mtp::can_gpu_accept(sp)) {
+    last_gpu_accept_ = true;
+    mtp_->encode_accept_gpu(e, s, P, R, verify_logits_, verify_accept_, sp, step, point_mass);
+  } else {
+    last_gpu_accept_ = false;
+    enc_sample(e, s, verify_logits_.view(size_t(R - 1) * V * 4, size_t(V) * 4), verify_samples_, R - 1, sp,
+               step + uint32_t(R - 1));
+  }
+}
+
+int Inkling2::accept_mtp(Seq& s, int P, int K, const SamplingParams& sp, uint32_t step, bool point_mass) const {
+  if (!mtp_) fatal("inkling2: MTP drafter not loaded");
+  return mtp_->accept(s, P, K, verify_logits_, verify_samples_, verify_accept_, sp, step, point_mass,
+                      last_gpu_accept_);
+}
+
+void Inkling2::encode_mtp_commit(Encoder& e, Seq& s, int pos0, int m) {
+  if (!mtp_ || m <= 0) return;
+  const size_t cbytes = conv_bytes_per_seq(cfg_);
+  enc_copy_buf(e, verify_conv_.view(size_t(m - 1) * cbytes, cbytes), s.conv[0], cbytes);
+  mtp_->encode_commit_context(e, s, pos0, m, tap_[0], tap_[1], tap_[2], h_norm_);
+}
+
+bool Inkling2::can_tree_spec() const {
+  return mtp_ && mtp_->can_tree() && cfg_.hq == cfg_.hkv * 3 && cfg_.head_dim == 128;
+}
+
+void Inkling2::encode_mtp_draft_tree(Encoder& e, Seq& s, int P, int R, const SamplingParams& sp) {
+  if (!can_tree_spec()) fatal("inkling2: beam tree speculation unavailable");
+  mtp_->encode_draft_tree(e, s, P, R, sp);
+}
+
+void Inkling2::encode_mtp_verify_tree(Encoder& e, Seq& s, int P, int R, const SamplingParams& sp, uint32_t step) {
+  if (!can_tree_spec()) fatal("inkling2: beam tree speculation unavailable");
+  if (R < 1 || R > Ink2Mtp::kMaxVerifyRows) fatal("inkling2: tree verify rows %d out of range", R);
+  if (P + R >= s.cap) fatal("context full (%d)", s.cap);
+  enc_forward(e, s, P, R, true, &verify_logits_, true, nullptr, true, true, &mtp_->tree_buf());
   enc_logit_mask(e, s, verify_logits_, R, cfg_.vocab, cfg_.vocab);
   const uint32_t V = uint32_t(cfg_.vocab);
   if (sp.temperature <= 0.0f) {
@@ -2052,22 +2254,79 @@ void Inkling2::encode_mtp_verify(Encoder& e, Seq& s, int P, int R, const Samplin
     e.buf(1, cand_i_);
     e.buf(2, verify_samples_);
     e.dispatch(uint32_t(R), 1, 1, 64);
+
+    last_gpu_accept_ = true;
+    mtp_->encode_accept_tree_gpu(e, s, P, R, verify_logits_, verify_samples_, verify_tree_accept_, sp, step);
+  } else if (Ink2Mtp::can_gpu_accept(sp)) {
+    last_gpu_accept_ = true;
+    mtp_->encode_accept_tree_gpu(e, s, P, R, verify_logits_, verify_samples_, verify_tree_accept_, sp, step);
   } else {
-    enc_sample(e, s, verify_logits_.view(size_t(R - 1) * V * 4, size_t(V) * 4), verify_samples_, R - 1, sp,
-               step + uint32_t(R - 1));
+    last_gpu_accept_ = false;
+    enc_sample(e, s, verify_logits_.view(0, size_t(V) * 4), verify_samples_, 0, sp, step);
   }
 }
 
-int Inkling2::accept_mtp(Seq& s, int P, int K, const SamplingParams& sp, uint32_t step) const {
-  if (!mtp_) fatal("inkling2: MTP drafter not loaded");
-  return mtp_->accept(s, P, K, verify_logits_, verify_samples_, sp, step);
+int Inkling2::accept_mtp_tree(Seq& s, int P, const SamplingParams& sp, uint32_t step, int* out_path) const {
+  if (!can_tree_spec()) fatal("inkling2: beam tree speculation unavailable");
+  const Ink2TreeAccept acc = mtp_->accept_tree(s, P, verify_logits_, verify_samples_, verify_tree_accept_, sp, step,
+                                               last_gpu_accept_);
+  if (out_path) {
+    for (int i = 0; i < acc.m; ++i) out_path[i] = acc.path[i];
+  }
+  return acc.m;
 }
 
-void Inkling2::encode_mtp_commit(Encoder& e, Seq& s, int pos0, int m) {
+void Inkling2::encode_mtp_commit_tree(Encoder& e, Seq& s, int pos0, const int* path, int m) {
   if (!mtp_ || m <= 0) return;
+  bool is_identity = true;
+  for (int i = 0; i < m; ++i) {
+    if (path[i] != i) {
+      is_identity = false;
+      break;
+    }
+  }
   const size_t cbytes = conv_bytes_per_seq(cfg_);
-  enc_copy_buf(e, verify_conv_.view(size_t(m - 1) * cbytes, cbytes), s.conv[0], cbytes);
-  mtp_->encode_commit_context(e, s, pos0, m, tap_[0], tap_[1], tap_[2], h_norm_);
+  if (is_identity) {
+    enc_copy_buf(e, verify_conv_.view(size_t(m - 1) * cbytes, cbytes), s.conv[0], cbytes);
+    mtp_->encode_commit_context(e, s, pos0, m, tap_[0], tap_[1], tap_[2], h_norm_);
+    return;
+  }
+  Ink2Grouped gp(e, true);
+  e.group_begin();
+  enc_copy_buf(e, verify_conv_.view(size_t(path[m - 1]) * cbytes, cbytes), s.conv[0], cbytes);
+  const uint32_t kvd = uint32_t(cfg_.hkv) * uint32_t(cfg_.head_dim);
+  const uint32_t kv_fp8_flag = use_kv_fp8_ ? 1u : 0u;
+  if (m > 1) {
+    Ink2KvCompactP kcp{uint32_t(pos0), 0u, 0u, kv_fp8_flag, kvd, uint32_t(m), {}};
+    for (int i = 0; i < m; ++i) kcp.path[i] = uint32_t(path[i]);
+    const Pipeline cpl = ink2_pipe("ink2_kv_compact");
+    const size_t nv = cfg_.schedule.size();
+    for (size_t v_idx = 0; v_idx < nv; ++v_idx) {
+      const bool swa = is_swa_slot(v_idx);
+      kcp.is_swa = swa ? 1u : 0u;
+      kcp.kv_cap = swa ? uint32_t(ring_rows_) : uint32_t(s.cap);
+      e.use(cpl);
+      e.buf(0, s.kc[v_idx]);
+      e.buf(1, s.vc[v_idx]);
+      e.val(2, kcp);
+      e.dispatch(1, 1, 1, kvd >> 2u);
+    }
+  }
+  const uint32_t H = uint32_t(cfg_.hidden);
+  Ink2GatherP gtp{uint32_t(m), H, {}};
+  for (int i = 0; i < m; ++i) gtp.path[i] = uint32_t(path[i]);
+  const Pipeline gpl = ink2_pipe("ink2_gather_rows");
+  const Buffer* srcs[4] = {&tap_[0], &tap_[1], &tap_[2], &h_norm_};
+  const Buffer* dsts[4] = {&n0_, &n1_, &n2_, &x_};
+  for (int ti = 0; ti < 4; ++ti) {
+    e.use(gpl);
+    e.buf(0, *srcs[ti]);
+    e.buf(1, *dsts[ti]);
+    e.val(2, gtp);
+    e.dispatch(((H >> 2u) + 255u) / 256u, uint32_t(m), 1, 256);
+  }
+  e.group_end();
+  mtp_->encode_commit_context(e, s, pos0, m, n0_, n1_, n2_, x_);
 }
 
 void Inkling2::encode_logits_rows(Encoder& e, Seq& s, int pos0, int T, const Buffer& out) {
@@ -2152,7 +2411,7 @@ int Inkling2::debug_tensor_unit_check() {
       e->buf(b++, moe_act_); e->buf(b++, eid_); e->buf(b++, ew_); e->buf(b++, L.w2->buf); e->buf(b++, L.w2_sc->buf);
       if (!L.is_mxfp8) e->buf(b++, L.w2_outer);
       e->buf(b++, moe_out_); e->val(b, mp);
-      e->dispatch((H + (L.is_mxfp8 ? 3u : 15u)) / (L.is_mxfp8 ? 4u : 16u), T, 1, 128);
+      e->dispatch((H + (L.is_mxfp8 ? 3u : 7u)) / (L.is_mxfp8 ? 4u : 8u), T, 1, 128);
       e->commit_and_wait();
       ref.assign(moe_out_.as<float>(), moe_out_.as<float>() + T * H);
     }

@@ -9,6 +9,7 @@
 #include "engine/tool_args.h"
 #include "model/flint_kv.h"
 #include "model/hy4_flash.h"
+#include "model/ink2_mtp.h"
 #include "model/inkling2.h"
 #include "model/kv_grow.h"
 #include "model/qwen4_config.h"
@@ -112,6 +113,66 @@ static void ngram_drafts(const int* tok, int P, int k, std::vector<int>& out, in
     }
   }
 }
+
+struct Ink2CopyIndex {
+  static constexpr uint32_t kMask = 32767u;
+  struct Slot {
+    uint64_t key = 0;
+    int32_t pos = -1;
+  };
+  std::vector<Slot> tab;
+  int indexed_until = 0;
+
+  Ink2CopyIndex() : tab(kMask + 1u) {}
+
+  static uint64_t hash_ngram(const int* tok, int end_pos, int len) {
+    uint64_t h = uint64_t(len) * 0x9e3779b97f4a7c15ULL;
+    for (int i = 0; i < len; ++i) {
+      h ^= uint64_t(uint32_t(tok[end_pos - len + 1 + i])) + 0x517cc1b727220a95ULL;
+      h = (h ^ (h >> 30)) * 0xbf58476d1ce4e5b9ULL;
+    }
+    h ^= (h >> 31);
+    return h ? h : 1ULL;
+  }
+
+  void advance(const int* tok, int P) {
+    for (int pos = std::max(3, indexed_until); pos < P; ++pos) {
+      if (pos >= 3) {
+        const uint64_t k4 = hash_ngram(tok, pos, 4);
+        tab[k4 & kMask] = Slot{k4, int32_t(pos)};
+      }
+      if (pos >= 5) {
+        const uint64_t k6 = hash_ngram(tok, pos, 6);
+        tab[k6 & kMask] = Slot{k6, int32_t(pos)};
+      }
+    }
+    if (P > indexed_until) indexed_until = P;
+  }
+
+  int lookup(const int* tok, int P, int max_k, std::vector<int>& out) {
+    out.clear();
+    advance(tok, P);
+    for (int n : {6, 4}) {
+      if (P + 1 < n) continue;
+      const uint64_t k = hash_ngram(tok, P, n);
+      const Slot s = tab[k & kMask];
+      const int hit_end = int(s.pos);
+      if (s.key != k || hit_end < n - 1 || hit_end >= P) continue;
+      bool eq = true;
+      for (int i = 0; i < n; ++i) {
+        if (tok[hit_end - n + 1 + i] != tok[P - n + 1 + i]) {
+          eq = false;
+          break;
+        }
+      }
+      if (!eq) continue;
+      const int cap = std::min(max_k, n >= 6 ? 15 : 8);
+      for (int j = 1; j <= cap && hit_end + j <= P; ++j) out.push_back(tok[hit_end + j]);
+      if (!out.empty()) return n;
+    }
+    return 0;
+  }
+};
 
 // Dory's speculative drafts (per-loop KV): NI_DORY_SPEC = both (the default: prompt lookup, else self-speculation),
 // ngram (prompt lookup only) or self
@@ -549,6 +610,7 @@ Engine::Engine(const EngineOptions& o) : opts_(o) {
   if (opts_.spec_depth > Qwen35::kMaxMtpRows - 1) opts_.spec_depth = Qwen35::kMaxMtpRows - 1;
   if (ink2_ && ink2_->has_mtp()) {
     const char* k_env = getenv("NI_INK2_MTP_K");
+    if (!k_env || !*k_env) k_env = getenv("NI_INK2_SPEC");
     const int env_k = (k_env && *k_env) ? atoi(k_env) : -1;
     if (spec_asked == 0 || (spec_asked < 0 && env_k == 0)) {
       ink2_->disable_mtp();
@@ -2974,6 +3036,7 @@ ChatResult Engine::chat(const ChatRequest& r_in, const std::function<bool(const 
     if (bt.size() < prompt.size() && std::equal(bt.begin(), bt.end(), prompt.begin())) boundary = int(bt.size());
   }
   if (boundary >= int(prompt.size())) boundary = -1;
+  if (ink2_ && boundary < 0 && prompt.size() >= 64) boundary = int(prompt.size()) - 1;
   // images: each placeholder becomes the image's rows; prefix reuse compares keys that tell images apart by content
   vision::Prompt mm;
   const vision::Prompt* mmp = nullptr;
@@ -4785,24 +4848,81 @@ ChatResult Engine::chat(const ChatRequest& r_in, const std::function<bool(const 
     req_cycles = 0;
     int pend_p0 = 0;
     int pend_m = 0;
+    bool pend_is_tree = false;
+    int pend_path[16] = {};
     static const bool suffix_on = [] {
       const char* v = getenv("NI_INK2_SUFFIX_DRAFT");
       return !(v && *v && atoi(v) == 0);
     }();
-    // Online 2-param cost model + per-depth accept EMAs + nmin=5 suffix lookup.
-    float step_ms = 17.3f;
+    static const int tree_env_mode = [] {
+      const char* v = getenv("NI_INK2_TREE");
+      return (v && *v) ? atoi(v) : -1;
+    }();
+    static const int tree_r_pin = [] {
+      const char* v = getenv("NI_INK2_TREE_R");
+      return (v && *v) ? atoi(v) : 0;
+    }();
+    const bool tree_enabled =
+        ink2_->can_tree_spec() && s.mask_rows == 0 &&
+        (tree_env_mode == 1 || (tree_env_mode != 0 && (ink2_spec_auto_ || tree_r_pin >= 2)));
+
+    // Per-channel state tracked strictly from committed tokens: 0=think(200008), 1=text(200004), 2=tool(200024/200049)
+    int chan = 0;
+    auto update_chan = [&](int tok_id) {
+      if (tok_id == 200008) chan = 0;
+      else if (tok_id == 200004) chan = 1;
+      else if (tok_id == 200024 || tok_id == 200049) chan = 2;
+    };
+    for (int pi = 0; pi <= n; ++pi) update_chan(s.tokens()[pi]);
+
+    // Online cost + accept EMAs for plain step, linear chain, W=4 beam tree, and gated incremental copy drafting.
+    const float ctx_k = float(std::min(n, 16384)) / 1024.0f;
+    const float ctx_scale = 1.0f + 0.025f * ctx_k;
+    float step_ms = 13.8f + 0.25f * ctx_k;
     float draft_ms = 2.4f;
-    float row_ms = 7.8f;
+    float row_ms = 3.2f;
     float p_depth[7] = {0.74f, 0.56f, 0.42f, 0.30f, 0.22f, 0.16f, 0.12f};
-    float lookup_e[7] = {1.50f, 2.00f, 2.50f, 3.00f, 3.50f, 4.00f, 4.50f};
+
+    static constexpr int kTreeRs[5] = {2, 3, 4, 6, 8};
+    float tree_yield[3][5];
+    if (sp.temperature <= 0.0f) {
+      const float g01[5] = {1.70f, 2.20f, 2.60f, 3.15f, 3.55f};
+      const float g2[5] = {1.80f, 2.35f, 2.80f, 3.40f, 3.85f};
+      for (int i = 0; i < 5; ++i) {
+        tree_yield[0][i] = g01[i];
+        tree_yield[1][i] = g01[i];
+        tree_yield[2][i] = g2[i];
+      }
+    } else {
+      const float t01[5] = {1.50f, 1.85f, 2.15f, 2.50f, 2.75f};
+      const float t2[5] = {1.60f, 2.00f, 2.35f, 2.75f, 3.05f};
+      for (int i = 0; i < 5; ++i) {
+        tree_yield[0][i] = t01[i];
+        tree_yield[1][i] = t01[i];
+        tree_yield[2][i] = t2[i];
+      }
+    }
+    int tree_visits[3][5] = {};
+    int tree_ms_visits[5] = {};
+    float tree_ms[5] = {18.5f * ctx_scale, 22.0f * ctx_scale, 25.0f * ctx_scale, 33.0f * ctx_scale,
+                        39.5f * ctx_scale};
+
+    Ink2CopyIndex copy_idx;
+    copy_idx.advance(s.tokens(), n);
+    float copy_row_ms = 3.5f;
+    float copy6_hit = 0.55f;
+    float copy4_hit = 0.30f;
     int plain_streak = 0;
     std::vector<int> suf_drafts;
+
     auto flush_pending = [&] {
       if (pend_m <= 0) return;
       auto ec = g.begin_grouped();
-      ink2_->encode_mtp_commit(*ec, s, pend_p0, pend_m);
+      if (pend_is_tree) ink2_->encode_mtp_commit_tree(*ec, s, pend_p0, pend_path, pend_m);
+      else ink2_->encode_mtp_commit(*ec, s, pend_p0, pend_m);
       ec->commit_and_wait();
       pend_m = 0;
+      pend_is_tree = false;
     };
     bool go = handle(s.tokens()[n]);
     while (go) {
@@ -4813,11 +4933,56 @@ ChatResult Engine::chat(const ChatRequest& r_in, const std::function<bool(const 
         break;
       }
       const int avail_k = std::min(ink2_spec_, s.limit - P - 2);
+      const int avail_tree_r = std::min(Ink2Mtp::kMaxVerifyRows, s.limit - P - 1);
       int K = avail_k;
+      int R_tree = 0;
+      int best_tree_idx = -1;
+      bool use_tree = false;
       float best_rate = 0.0f;
-      if (ink2_spec_auto_) {
-        const bool force_probe = (plain_streak >= 12);
-        const float rate_0 = 1.0f / std::max(0.5f, step_ms);
+      const float rate_0 = 1.0f / std::max(0.5f, step_ms);
+      const bool force_probe = (plain_streak >= 16);
+
+      if (tree_enabled && avail_tree_r >= 2) {
+        if (tree_r_pin >= 2) {
+          R_tree = std::min(tree_r_pin, avail_tree_r);
+          use_tree = (R_tree >= 2);
+          int nearest = 0;
+          int best_d = 999;
+          for (int i = 0; i < 5; ++i) {
+            if (R_tree == kTreeRs[i]) best_tree_idx = i;
+            const int dd = std::abs(kTreeRs[i] - R_tree);
+            if (dd < best_d) { best_d = dd; nearest = i; }
+          }
+          best_rate = std::max(rate_0, tree_yield[chan][nearest] / std::max(1.0f, tree_ms[nearest]));
+        } else {
+          int best_idx = 0;
+          float best_t_rate = -1.0f;
+          float best_true_rate = -1.0f;
+          for (int i = 0; i < 5; ++i) {
+            if (kTreeRs[i] > avail_tree_r) break;
+            const float true_rate = tree_yield[chan][i] / std::max(1.0f, tree_ms[i]);
+            const float ucb =
+                (sp.temperature > 0.0f ? 0.06f : 0.08f) / std::sqrt(1.0f + float(tree_visits[chan][i]));
+            const float rate = true_rate + ucb / std::max(1.0f, tree_ms[i]);
+            if (rate > best_t_rate) {
+              best_t_rate = rate;
+              best_true_rate = true_rate;
+              best_idx = i;
+            }
+          }
+          const float cmp_rate = (tree_visits[chan][best_idx] >= 2) ? best_true_rate : best_t_rate;
+          if (!force_probe && cmp_rate < rate_0 * 0.99f) {
+            use_tree = false;
+            K = 0;
+            best_rate = rate_0;
+          } else {
+            use_tree = true;
+            best_tree_idx = best_idx;
+            R_tree = std::min(kTreeRs[best_idx], avail_tree_r);
+            best_rate = std::max(rate_0, best_true_rate);
+          }
+        }
+      } else if (ink2_spec_auto_) {
         int best_k = 1;
         float best_dspark_rate = -1.0f;
         float prob = 1.0f, exp_m = 1.0f;
@@ -4831,7 +4996,7 @@ ChatResult Engine::chat(const ChatRequest& r_in, const std::function<bool(const 
             best_k = kc;
           }
         }
-        K = (!force_probe && best_dspark_rate < rate_0 * 0.96f) ? 0 : best_k;
+        K = (!force_probe && best_dspark_rate < rate_0 * 0.98f) ? 0 : best_k;
         best_rate = std::max(rate_0, best_dspark_rate);
       } else {
         float prob = 1.0f, exp_m = 1.0f;
@@ -4839,23 +5004,35 @@ ChatResult Engine::chat(const ChatRequest& r_in, const std::function<bool(const 
           prob *= p_depth[kc - 1];
           exp_m += prob;
         }
-        best_rate = exp_m / std::max(1.0f, step_ms + draft_ms + row_ms * float(avail_k));
+        best_rate = std::max(rate_0, exp_m / std::max(1.0f, step_ms + draft_ms + row_ms * float(avail_k)));
       }
 
       bool use_suffix = false;
-      if (suffix_on && sp.temperature <= 0.0f) {
-        ngram_drafts(s.tokens(), P, std::min(avail_k, 5), suf_drafts, 6, 5);
-        if (!suf_drafts.empty()) {
-          const int lk = std::clamp(int(suf_drafts.size()), 1, avail_k);
-          const float suf_rate = lookup_e[lk - 1] / std::max(1.0f, step_ms + row_ms * float(lk));
-          if (suf_rate > best_rate * 1.03f) {
-            use_suffix = true;
-            K = lk;
+      int copy_match_n = 0;
+      const bool allow_suffix =
+          suffix_on && ink2_spec_auto_ && tree_r_pin < 2 && s.mask_rows == 0 &&
+          (sp.temperature <= 0.0f || Ink2Mtp::can_gpu_accept(sp));
+      if (allow_suffix) {
+        const int avail_copy = std::min(7, s.limit - P - 2);
+        if (avail_copy >= 1) {
+          copy_match_n = copy_idx.lookup(s.tokens(), P, avail_copy, suf_drafts);
+          if (!suf_drafts.empty() && (copy_match_n >= 6 || (copy_match_n >= 4 && copy4_hit >= 0.50f))) {
+            const int max_lk = (copy_match_n >= 6) ? avail_copy : std::min(3, avail_copy);
+            const int lk = std::clamp(int(suf_drafts.size()), 1, max_lk);
+            const float hit_ema = (copy_match_n >= 6) ? copy6_hit : copy4_hit;
+            const float exp_copy = 1.0f + hit_ema * float(lk);
+            const float copy_pred_ms = std::max(1.0f, step_ms + 3.0f + copy_row_ms * float(lk));
+            const float suf_rate = exp_copy / copy_pred_ms;
+            if (suf_rate > best_rate * 1.08f) {
+              use_suffix = true;
+              use_tree = false;
+              K = lk;
+            }
           }
         }
       }
 
-      if (!use_suffix && K == 0) {
+      if (!use_tree && !use_suffix && K == 0) {
         if (P + 2 > s.cap) {
           flush_pending();
           if (!grow_kv(std::min(s.limit, P + 2), [] {}) || P + 2 > s.cap) {
@@ -4867,14 +5044,17 @@ ChatResult Engine::chat(const ChatRequest& r_in, const std::function<bool(const 
         const double t_cyc0 = now_ms();
         auto e2 = g.begin_grouped();
         if (pend_m > 0) {
-          ink2_->encode_mtp_commit(*e2, s, pend_p0, pend_m);
+          if (pend_is_tree) ink2_->encode_mtp_commit_tree(*e2, s, pend_p0, pend_path, pend_m);
+          else ink2_->encode_mtp_commit(*e2, s, pend_p0, pend_m);
           pend_m = 0;
+          pend_is_tree = false;
         }
         ink2_->encode_step(*e2, s, P, sp, uint32_t(P), true);
         e2->commit_and_wait();
         const float cyc_ms = float(now_ms() - t_cyc0);
         if (cyc_ms > 0.1f && cyc_ms < 500.0f) step_ms = 0.92f * step_ms + 0.08f * cyc_ms;
         ++plain_streak;
+        update_chan(s.tokens()[P + 1]);
         go = handle(s.tokens()[P + 1]);
         ++spec_cycles_;
         ++req_cycles;
@@ -4882,6 +5062,67 @@ ChatResult Engine::chat(const ChatRequest& r_in, const std::function<bool(const 
         cycle_done(1);
         P += 1;
         if (go && contended()) yield_turn(res);
+        continue;
+      }
+
+      if (use_tree) {
+        if (P + R_tree + 1 > s.cap) {
+          flush_pending();
+          if (!grow_kv(std::min(s.limit, P + R_tree + 1), [] {}) || P + 3 > s.cap) {
+            finish = "length";
+            res.context_full = true;
+            break;
+          }
+          R_tree = std::min(R_tree, s.cap - P - 1);
+        }
+        const double t_cyc0 = now_ms();
+        auto e2 = g.begin_grouped();
+        if (pend_m > 0) {
+          if (pend_is_tree) ink2_->encode_mtp_commit_tree(*e2, s, pend_p0, pend_path, pend_m);
+          else ink2_->encode_mtp_commit(*e2, s, pend_p0, pend_m);
+          pend_m = 0;
+          pend_is_tree = false;
+        }
+        ink2_->encode_mtp_draft_tree(*e2, s, P, R_tree, sp);
+        ink2_->encode_mtp_verify_tree(*e2, s, P, R_tree, sp, uint32_t(P));
+        e2->commit_and_wait();
+        const float cyc_ms = float(now_ms() - t_cyc0);
+        const int cur_chan = chan;
+        const int m_ret = ink2_->accept_mtp_tree(s, P, sp, uint32_t(P), pend_path);
+        if (best_tree_idx >= 0) {
+          if (cyc_ms > 0.1f && cyc_ms < 500.0f) {
+            const float lr_ms = tree_ms_visits[best_tree_idx] < 4 ? 0.45f : 0.15f;
+            tree_ms[best_tree_idx] = (1.0f - lr_ms) * tree_ms[best_tree_idx] + lr_ms * cyc_ms;
+            ++tree_ms_visits[best_tree_idx];
+          }
+          const float lr = tree_visits[cur_chan][best_tree_idx] < 6 ? 0.25f : 0.12f;
+          tree_yield[cur_chan][best_tree_idx] =
+              (1.0f - lr) * tree_yield[cur_chan][best_tree_idx] + lr * float(m_ret);
+          ++tree_visits[cur_chan][best_tree_idx];
+        }
+        plain_streak = 0;
+        const int* tk = s.tokens();
+        int m = 0;
+        while (m < m_ret) {
+          ++m;
+          update_chan(tk[P + m]);
+          if (!handle(tk[P + m])) {
+            go = false;
+            break;
+          }
+        }
+        pend_p0 = P;
+        pend_m = m;
+        pend_is_tree = true;
+        ++spec_cycles_;
+        ++req_cycles;
+        spec_accepted_ += m;
+        cycle_done(m);
+        P += m;
+        if (go && contended()) {
+          flush_pending();
+          yield_turn(res);
+        }
         continue;
       }
 
@@ -4901,22 +5142,27 @@ ChatResult Engine::chat(const ChatRequest& r_in, const std::function<bool(const 
       const double t_cyc0 = now_ms();
       auto e2 = g.begin_grouped();
       if (pend_m > 0) {
-        ink2_->encode_mtp_commit(*e2, s, pend_p0, pend_m);
+        if (pend_is_tree) ink2_->encode_mtp_commit_tree(*e2, s, pend_p0, pend_path, pend_m);
+        else ink2_->encode_mtp_commit(*e2, s, pend_p0, pend_m);
         pend_m = 0;
+        pend_is_tree = false;
       }
       if (!use_suffix) ink2_->encode_mtp_draft(*e2, s, P, K, sp, uint32_t(P));
-      ink2_->encode_mtp_verify(*e2, s, P, K + 1, sp, uint32_t(P));
+      ink2_->encode_mtp_verify(*e2, s, P, K + 1, sp, uint32_t(P), use_suffix);
       e2->commit_and_wait();
       const float cyc_ms = float(now_ms() - t_cyc0);
-      const int a = ink2_->accept_mtp(s, P, K, sp, uint32_t(P));
+      const int a = ink2_->accept_mtp(s, P, K, sp, uint32_t(P), use_suffix);
       if (cyc_ms > 0.1f && cyc_ms < 500.0f && K >= 1) {
-        const float obs_row = std::clamp((cyc_ms - (use_suffix ? 0.0f : draft_ms) - step_ms) / float(K), 1.0f, 30.0f);
-        row_ms = 0.92f * row_ms + 0.08f * obs_row;
+        const float obs_row =
+            std::clamp((cyc_ms - (use_suffix ? 3.0f : draft_ms) - step_ms) / float(K), 0.8f, 30.0f);
+        if (use_suffix) copy_row_ms = 0.88f * copy_row_ms + 0.12f * obs_row;
+        else row_ms = 0.92f * row_ms + 0.08f * obs_row;
       }
       plain_streak = 0;
       if (use_suffix) {
-        const int lb = std::clamp(K, 1, 7) - 1;
-        lookup_e[lb] = 0.80f * lookup_e[lb] + 0.20f * float(a + 1);
+        const float obs_hit = float(a) / float(std::max(1, K));
+        if (copy_match_n >= 6) copy6_hit = 0.75f * copy6_hit + 0.25f * obs_hit;
+        else copy4_hit = 0.75f * copy4_hit + 0.25f * obs_hit;
       } else {
         const int lim = std::min(a + 1, K);
         for (int j = 0; j < lim && j < 7; ++j) {
@@ -4928,6 +5174,7 @@ ChatResult Engine::chat(const ChatRequest& r_in, const std::function<bool(const 
       int m = 0;
       while (m < a + 1) {
         ++m;
+        update_chan(tk[P + m]);
         if (!handle(tk[P + m])) {
           go = false;
           break;
@@ -4935,6 +5182,7 @@ ChatResult Engine::chat(const ChatRequest& r_in, const std::function<bool(const 
       }
       pend_p0 = P;
       pend_m = m;
+      pend_is_tree = false;
       ++spec_cycles_;
       ++req_cycles;
       spec_accepted_ += m;
