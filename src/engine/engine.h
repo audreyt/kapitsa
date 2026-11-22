@@ -706,6 +706,8 @@ class Engine {
   Hy4Flash* hy4_ = nullptr;  // model_ when it is Hy4-flash
   Clover* clover_ = nullptr;  // model_ when it is Clover (block diffusion; q35_ too)
   Inkling2* ink2_ = nullptr;  // model_ when it is Inkling-2-Mini (inkling2_loop)
+  int ink2_spec_ = 0;        // Inkling-2-Mini MTP draft depth (0: plain, -1: auto 1..7, >0: pinned K)
+  bool ink2_spec_auto_ = false;  // adaptive K_cur in 1..ink2_spec_ when --spec/-1 and NI_INK2_MTP_K unset
   int flint_ngram_ = 0;      // Flint: prompt-lookup drafts per cycle (0: plain decoding)
   // Flint: self-drafts per cycle at long contexts (Flint::encode_draft; 0: none), their full-attention layers' window,
   // and the shortest prompt that takes them

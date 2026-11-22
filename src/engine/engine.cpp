@@ -547,6 +547,20 @@ Engine::Engine(const EngineOptions& o) : opts_(o) {
   if (opts_.spec_depth < 0) opts_.spec_depth = q35_ ? q35_->default_spec_depth() : 0;
   spec_ = q35_ && opts_.spec_depth > 0 && q35_->has_mtp();
   if (opts_.spec_depth > Qwen35::kMaxMtpRows - 1) opts_.spec_depth = Qwen35::kMaxMtpRows - 1;
+  if (ink2_ && ink2_->has_mtp()) {
+    const char* k_env = getenv("NI_INK2_MTP_K");
+    const int env_k = (k_env && *k_env) ? atoi(k_env) : -1;
+    if (spec_asked == 0 || (spec_asked < 0 && env_k == 0)) {
+      ink2_->disable_mtp();
+      ink2_spec_ = 0;
+      ink2_spec_auto_ = false;
+    } else {
+      const int max_k = std::max(1, ink2_->mtp_block() - 1);
+      ink2_spec_auto_ = (spec_asked < 0 && env_k < 0);
+      const int want_k = spec_asked > 0 ? spec_asked : (env_k > 0 ? env_k : max_k);
+      ink2_spec_ = std::clamp(want_k, 1, max_k);
+    }
+  }
   std::string dflash_unsupported;  // a drafter auto found that this model's format does not fit
   if (q35_ && q35_->block_drafter_ok() && !lp.dflash_off && lp.dflash_left_out.empty()) {
     const std::string& dir = lp.dflash;
@@ -750,6 +764,7 @@ Engine::Engine(const EngineOptions& o) : opts_(o) {
                          : dfl_ && dfl_->tree() ? std::string("KFlash speculative decoding (DFlash2 lattice, tree verify)")
                          : dfl_ ? "DFlash2 speculative decoding (verify " + std::to_string(dfl_->verify_depth()) + " of 7)"
                          : spec_ ? "MTP speculative decoding depth " + std::to_string(opts_.spec_depth)
+                         : ink2_spec_ > 0 ? "MTP speculative decoding depth " + std::to_string(ink2_spec_)
                          : dory_spec_ > 0 ? "speculative decoding (" +
                                                     (dory_spec_kind() == "ngram"  ? std::string("prompt lookup")
                                                      : dory_spec_kind() == "self" ? std::string("1-loop drafts")
@@ -770,7 +785,7 @@ Engine::Engine(const EngineOptions& o) : opts_(o) {
     f.unsupported = dflash_unsupported;
     f.unbound = lp.dflash_unbound;
     f.unbound_missing = lp.dflash_unbound_missing;
-    f.mtp_depth = spec_ ? opts_.spec_depth : 0;
+    f.mtp_depth = spec_ ? opts_.spec_depth : ink2_spec_;
     f.self_drafts = flint_ngram_ > 0 && flint_self_ > 0                ? "prompt lookup and Flint self-drafts"
                     : flint_self_ > 0                                 ? "Flint self-drafts at long prompts"
                     : flint_ngram_ > 0 || nh_ngram_ > 0               ? "prompt lookup"
@@ -802,7 +817,7 @@ std::string Engine::kflash_source() const {
   if (lili_) return lili_->name();
   if (dfl_) return "DFlash2";
   if (flint_ngram_ > 0 || nh_ngram_ > 0) return "prompt lookup";
-  if (spec_) return "MTP";
+  if (spec_ || ink2_spec_ > 0) return "MTP";
   if (dory_spec_ > 0)
     return dory_spec_kind() == "ngram" ? "prompt lookup" : dory_spec_kind() == "self" ? "1-loop drafts" : "prompt lookup, 1-loop drafts";
   return "none";
@@ -3334,7 +3349,7 @@ ChatResult Engine::chat(const ChatRequest& r_in, const std::function<bool(const 
   // batches. The other speculative loops' verifies and acceptances keep 64 candidates per row: plain steps there.
   // (Clover's own loops draw from the whole vocabulary already, its pick kernel applying no top-k: they are kept.)
   const bool full_tree = full_vocab(sp) && lili_ && kf_budget_;
-  const bool full_steps = full_vocab(sp) && !clover_own && !full_tree;
+  const bool full_steps = full_vocab(sp) && !clover_own && !full_tree && ink2_spec_ == 0;
   if (full_steps)
     logi("chat: top_k %d at temperature %.2f: sampled over the whole vocabulary, plain steps (kapitsa#1286)", sp.top_k,
          sp.temperature);
@@ -3989,8 +4004,8 @@ ChatResult Engine::chat(const ChatRequest& r_in, const std::function<bool(const 
     return !(v && v[0] == '0');
   }();
   const bool flint_self = flint_self_ > 0 && n >= flint_self_min_;  // Flint drafts itself this request
-  const bool spec_loop =
-      !full_steps && (lili_ || dfl_ || dory_spec_ > 0 || nh_ngram_ > 0 || flint_ngram_ > 0 || flint_self || depth > 0);
+  const bool spec_loop = !full_steps && (lili_ || dfl_ || dory_spec_ > 0 || ink2_spec_ > 0 || nh_ngram_ > 0 ||
+                                         flint_ngram_ > 0 || flint_self || depth > 0);
   const bool g_dfl = gm && dfl_ && grammar_spec && !full_steps;
   const bool g_direct = gm && !g_dfl && (g_on || !spec_loop);
   g_in_spec = gm && !g_direct && !g_on;
@@ -4765,6 +4780,95 @@ ChatResult Engine::chat(const ChatRequest& r_in, const std::function<bool(const 
     q35_->encode_flush(*e3, s);
     e3->commit_and_wait();
     fed_until = P;
+  } else if (ink2_spec_ > 0) {
+    int P = n;
+    req_cycles = 0;
+    int pend_p0 = 0;
+    int pend_m = 0;
+    int k_cur = ink2_spec_auto_ ? std::min(3, ink2_spec_) : ink2_spec_;
+    int full_streak = 0;
+    float wins_ema = 2.0f;
+    float trials_ema = 3.2f;
+    auto flush_pending = [&] {
+      if (pend_m <= 0) return;
+      auto ec = g.begin_grouped();
+      ink2_->encode_mtp_commit(*ec, s, pend_p0, pend_m);
+      ec->commit_and_wait();
+      pend_m = 0;
+    };
+    bool go = handle(s.tokens()[n]);
+    while (go) {
+      if (P + 3 > s.limit) {
+        flush_pending();
+        finish = "length";
+        res.context_full = true;
+        break;
+      }
+      int K = std::min(k_cur, s.limit - P - 2);
+      if (P + K + 2 > s.cap) {
+        flush_pending();
+        if (!grow_kv(std::min(s.limit, P + K + 2), [] {}) || P + 3 > s.cap) {
+          finish = "length";
+          res.context_full = true;
+          break;
+        }
+        K = std::min(k_cur, s.cap - P - 2);
+      }
+      flush_pending();
+      auto e2 = g.begin_grouped();
+      ink2_->encode_mtp_draft(*e2, s, P, K, sp, uint32_t(P));
+      ink2_->encode_mtp_verify(*e2, s, P, K + 1, sp, uint32_t(P));
+      e2->commit_and_wait();
+      const int a = ink2_->accept_mtp(s, P, K, sp, uint32_t(P));
+      if (ink2_spec_auto_ && K == k_cur) {
+        wins_ema = 0.7f * wins_ema + float(a);
+        trials_ema = 0.7f * trials_ema + float(std::min(a + 1, K));
+        if (a == K) {
+          ++full_streak;
+          k_cur = std::min(ink2_spec_, k_cur + (full_streak >= 2 ? 2 : 1));
+        } else {
+          full_streak = 0;
+          const float p_hat = std::clamp(wins_ema / std::max(1.0f, trials_ema), 0.1f, 0.99f);
+          constexpr float c_rel = 0.42f;
+          int best_k = 1;
+          float best_rate = -1.0f;
+          float pk = p_hat;
+          float expect_m = 1.0f;
+          for (int kc = 1; kc <= ink2_spec_; ++kc) {
+            expect_m += pk;
+            pk *= p_hat;
+            const float rate = expect_m / (1.0f + c_rel * float(kc));
+            if (rate > best_rate) {
+              best_rate = rate;
+              best_k = kc;
+            }
+          }
+          k_cur = best_k;
+        }
+      }
+      const int* tk = s.tokens();
+      int m = 0;
+      while (m < a + 1) {
+        ++m;
+        if (!handle(tk[P + m])) {
+          go = false;
+          break;
+        }
+      }
+      pend_p0 = P;
+      pend_m = m;
+      ++spec_cycles_;
+      ++req_cycles;
+      spec_accepted_ += m;
+      cycle_done(m);
+      P += m;
+      if (go && contended()) {
+        flush_pending();
+        yield_turn(res);
+      }
+    }
+    flush_pending();
+    fed_until = P;
   } else {
     plain_steps();
   }
@@ -4955,7 +5059,7 @@ ChatResult Engine::chat(const ChatRequest& r_in, const std::function<bool(const 
   slot.live_ok = finish == "tool_calls";
   ++slot.version;  // (a state the SSD prefix cache does not have yet)
   char cyc[192] = "";
-  if ((dfl_ || lili_ || dory_spec_ || nh_ngram_ || flint_ngram_ || flint_self_) && req_cycles > 0)
+  if ((dfl_ || lili_ || dory_spec_ || ink2_spec_ || nh_ngram_ || flint_ngram_ || flint_self_) && req_cycles > 0)
     snprintf(cyc, sizeof cyc, ", %.2f tok/cycle", double(gen - 1) / req_cycles);
   if (clover_own && clover_own->self_spec() && req_cycles > 0)
     snprintf(cyc, sizeof cyc, ", %.2f tok/cycle (%d-row draft and verify)", double(gen - 1) / req_cycles,

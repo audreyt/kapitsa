@@ -22,9 +22,27 @@ constant float kE2M1[16] = {
     -0.0f, -0.5f, -1.0f, -1.5f, -2.0f, -3.0f, -4.0f, -6.0f,
 };
 
+NI_INLINE float4 ink2_e2m1_4_raw(uint packed16) {
+  const uint p0 = ((packed16 & 0x0008u) << 12) | ((packed16 & 0x0007u) << 9) |
+                  ((packed16 & 0x0080u) << 24) | ((packed16 & 0x0070u) << 21);
+  const uint p1 = ((packed16 & 0x0800u) << 4) | ((packed16 & 0x0700u) << 1) |
+                  ((packed16 & 0x8000u) << 16) | ((packed16 & 0x7000u) << 13);
+  return float4(float2(as_type<half2>(p0)), float2(as_type<half2>(p1)));
+}
+
 NI_INLINE float ink2_e4m3(uint b) {
   const ushort h = ushort(((b & 0x80u) << 8) | ((b & 0x7Fu) << 7));
   return float(as_type<half>(h)) * 256.0f;
+}
+
+NI_INLINE float ink2_e4m3_16384(uint b) {
+  const ushort h = ushort(((b & 0x80u) << 8) | ((b & 0x7Fu) << 7));
+  return float(as_type<half>(h)) * 4194304.0f;
+}
+
+NI_INLINE float4 ink2_e4m3_4(uint packed32) {
+  return float4(ink2_e4m3(packed32 & 0xFFu), ink2_e4m3((packed32 >> 8) & 0xFFu),
+                ink2_e4m3((packed32 >> 16) & 0xFFu), ink2_e4m3(packed32 >> 24));
 }
 
 NI_INLINE float ink2_ue8m0(uint b) {
@@ -646,14 +664,14 @@ struct Ink2MultiMmP {
 
 // ---- 6. Short Causal Convolutions (static & dynamic) ----
 struct Ink2SconvStaticP {
-  uint T, C, w_f32, add_res;
+  uint T, C, w_f32, save_snap, snap_stride, add_res;
   float scale;
 };
 
 [[kernel]] void ink2_sconv_static(const device float* x [[buffer(0)]], const device void* w [[buffer(1)]],
                                   device float* hist [[buffer(2)]], device float* out [[buffer(3)]],
-                                  constant Ink2SconvStaticP& p [[buffer(4)]], const device float* res [[buffer(5)]],
-                                  uint c [[thread_position_in_grid]]) {
+                                  constant Ink2SconvStaticP& p [[buffer(4)]], device float* snap [[buffer(5)]],
+                                  const device float* res [[buffer(6)]], uint c [[thread_position_in_grid]]) {
   if (c >= p.C) return;
   float w0, w1, w2, w3;
   if (p.w_f32) {
@@ -672,6 +690,12 @@ struct Ink2SconvStaticP {
     if (p.add_res) y += res[idx];
     out[idx] = y;
     h0 = h1; h1 = h2; h2 = xt;
+    if (p.save_snap) {
+      const size_t sb = size_t(t) * size_t(p.snap_stride) + c;
+      snap[sb + 0 * p.C] = h0;
+      snap[sb + 1 * p.C] = h1;
+      snap[sb + 2 * p.C] = h2;
+    }
   }
   hist[0 * p.C + c] = h0;
   hist[1 * p.C + c] = h1;
@@ -709,13 +733,13 @@ struct Ink2SconvStaticP {
 }
 
 struct Ink2SconvDynP {
-  uint T, C, n_heads, sw_f32;
+  uint T, C, n_heads, sw_f32, save_snap, snap_stride;
 };
 
 [[kernel]] void ink2_sconv_dynamic(const device float* x [[buffer(0)]], const device float* dyn [[buffer(1)]],
                                    const device void* static_w [[buffer(2)]], device float* hist [[buffer(3)]],
                                    device float* out [[buffer(4)]], constant Ink2SconvDynP& p [[buffer(5)]],
-                                   uint c [[thread_position_in_grid]]) {
+                                   device float* snap [[buffer(6)]], uint c [[thread_position_in_grid]]) {
   if (c >= p.C) return;
   const uint head_dim = p.C / p.n_heads;
   const uint h = c / head_dim;
@@ -731,6 +755,12 @@ struct Ink2SconvDynP {
     const float conv = (sw[0] + d.x) * xt + (sw[1] + d.y) * h2 + (sw[2] + d.z) * h1 + (sw[3] + d.w) * h0;
     out[size_t(t) * p.C + c] = (conv + xt) * (1.0f / 3.0f);
     h0 = h1; h1 = h2; h2 = xt;
+    if (p.save_snap) {
+      const size_t sb = size_t(t) * size_t(p.snap_stride) + c;
+      snap[sb + 0 * p.C] = h0;
+      snap[sb + 1 * p.C] = h1;
+      snap[sb + 2 * p.C] = h2;
+    }
   }
   hist[0 * p.C + c] = h0;
   hist[1 * p.C + c] = h1;
@@ -969,6 +999,121 @@ struct Ink2AttnDecP {
   const float4 sig = float4(1.0f) / (float4(1.0f) + float4(metal::precise::exp(-g4.x), metal::precise::exp(-g4.y),
                                                            metal::precise::exp(-g4.z), metal::precise::exp(-g4.w)));
   *(device float4*)(out + size_t(h) * p.D + d0) = (oo / ll) * sig;
+}
+
+struct Ink2AttnVerP {
+  uint T, pos0, kv_cap, Hq, Hkv, D, rel_extent, is_swa, swa, chunk, nchunks;
+  float scale;
+};
+
+[[kernel]] void ink2_attn_verify(const device float* q [[buffer(0)]], const device half* kc [[buffer(1)]],
+                                 const device half* vc [[buffer(2)]], const device float* rb [[buffer(3)]],
+                                 device float* pm [[buffer(4)]], device float* pl [[buffer(5)]],
+                                 device float* po [[buffer(6)]], constant Ink2AttnVerP& p [[buffer(7)]],
+                                 uint2 tg [[threadgroup_position_in_grid]], uint sg [[simdgroup_index_in_threadgroup]],
+                                 uint lane [[thread_index_in_simdgroup]]) {
+  threadgroup float tgm[4], tgl[4], tgo[4][128];
+  const uint h = tg.x, cid = tg.y;
+  const uint hkv = h / (p.Hq / p.Hkv);
+  const uint d0 = lane * 4;
+  float4 qv[8], ow[8];
+  float mw[8], lw[8];
+  for (uint t = 0; t < p.T; ++t) {
+    qv[t] = *(const device float4*)(q + (size_t(t) * p.Hq + h) * p.D + d0);
+    mw[t] = -INFINITY;
+    lw[t] = 0.0f;
+    ow[t] = float4(0.0f);
+  }
+  const uint k_min = (p.is_swa && p.pos0 + 1u > p.swa) ? (p.pos0 + 1u - p.swa) : 0u;
+  const uint k_max = p.pos0 + p.T;
+  const uint c0 = k_min + cid * p.chunk;
+  const uint c1 = min(k_max, c0 + p.chunk);
+
+  for (uint kp = c0 + sg; kp < c1; kp += 4) {
+    const uint slot = p.is_swa ? (kp % p.kv_cap) : kp;
+    const size_t koff = (size_t(slot) * p.Hkv + hkv) * p.D + d0;
+    const float4 kv = float4(*(const device half4*)(kc + koff));
+    const float4 vv = float4(*(const device half4*)(vc + koff));
+    for (uint t = 0; t < p.T; ++t) {
+      const uint qpos = p.pos0 + t;
+      const uint t_min = (p.is_swa && qpos + 1u > p.swa) ? (qpos + 1u - p.swa) : 0u;
+      if (kp < t_min || kp > qpos) continue;
+      float sc = simd_sum(dot(qv[t], kv)) * p.scale;
+      const uint dist = qpos - kp;
+      if (dist < p.rel_extent) sc += rb[(size_t(t) * p.Hq + h) * p.rel_extent + dist];
+      if (lw[t] == 0.0f) {
+        mw[t] = sc; lw[t] = 1.0f; ow[t] = vv;
+      } else {
+        const float nm = max(mw[t], sc);
+        const float e1 = metal::precise::exp(mw[t] - nm), e2 = metal::precise::exp(sc - nm);
+        ow[t] = ow[t] * e1 + vv * e2;
+        lw[t] = lw[t] * e1 + e2;
+        mw[t] = nm;
+      }
+    }
+  }
+  for (uint t = 0; t < p.T; ++t) {
+    if (lane == 0) {
+      tgm[sg] = mw[t];
+      tgl[sg] = lw[t];
+    }
+    *(threadgroup float4*)(&tgo[sg][d0]) = ow[t];
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (sg == 0) {
+      float mm = -INFINITY, ll = 0.0f;
+      float4 oo = float4(0.0f);
+      for (uint s = 0; s < 4; ++s) {
+        const float l2 = tgl[s];
+        if (l2 == 0.0f) continue;
+        const float m2 = tgm[s];
+        const float4 o2 = *(const threadgroup float4*)(&tgo[s][d0]);
+        if (ll == 0.0f) {
+          mm = m2; ll = l2; oo = o2;
+        } else {
+          const float nm = max(mm, m2);
+          const float e1 = metal::precise::exp(mm - nm), e2 = metal::precise::exp(m2 - nm);
+          oo = oo * e1 + o2 * e2;
+          ll = ll * e1 + l2 * e2;
+          mm = nm;
+        }
+      }
+      const size_t out_idx = (size_t(t) * p.Hq + h) * p.nchunks + cid;
+      if (lane == 0) {
+        pm[out_idx] = mm;
+        pl[out_idx] = ll;
+      }
+      *(device float4*)(po + out_idx * p.D + d0) = oo;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+  }
+}
+
+[[kernel]] void ink2_attn_verify_reduce(const device float* pm [[buffer(0)]], const device float* pl [[buffer(1)]],
+                                        const device float* po [[buffer(2)]], const device float* sinks [[buffer(3)]],
+                                        const device float* gate [[buffer(4)]], device float* out [[buffer(5)]],
+                                        constant Ink2AttnVerP& p [[buffer(6)]], uint2 tg [[threadgroup_position_in_grid]],
+                                        uint lane [[thread_index_in_simdgroup]]) {
+  const uint h = tg.x, t = tg.y, d0 = lane * 4;
+  float mm = sinks[size_t(t) * p.Hq + h], ll = 1.0f;
+  float4 oo = float4(0.0f);
+  const size_t row_base = (size_t(t) * p.Hq + h) * p.nchunks;
+  for (uint cid = 0; cid < p.nchunks; ++cid) {
+    const size_t idx = row_base + cid;
+    const float l2 = pl[idx];
+    if (l2 == 0.0f) continue;
+    const float m2 = pm[idx];
+    const float4 o2 = *(const device float4*)(po + idx * p.D + d0);
+    const float nm = max(mm, m2);
+    const float e1 = metal::precise::exp(mm - nm), e2 = metal::precise::exp(m2 - nm);
+    oo = oo * e1 + o2 * e2;
+    ll = ll * e1 + l2 * e2;
+    mm = nm;
+  }
+  const size_t out_off = (size_t(t) * p.Hq + h) * p.D + d0;
+  const float4 g4 = *(const device float4*)(gate + out_off);
+  const float4 sig = float4(1.0f) / (float4(1.0f) + float4(metal::precise::exp(-g4.x), metal::precise::exp(-g4.y),
+                                                           metal::precise::exp(-g4.z), metal::precise::exp(-g4.w)));
+  *(device float4*)(out + out_off) = (oo / ll) * sig;
 }
 
 struct Ink2AttnPfP {
@@ -1263,4 +1408,553 @@ struct Ink2SoftcapP {
 [[kernel]] void ink2_softcap(device float* x [[buffer(0)]], constant Ink2SoftcapP& p [[buffer(1)]],
                              uint i [[thread_position_in_grid]]) {
   if (i < p.n) x[i] = p.cap * metal::precise::tanh(x[i] * p.inv_cap);
+}
+
+// ---- 14. GPU-bucketed Small-Batch MoE (2 <= T <= 31, Metal 3 compute, zero atomics) ----
+struct Ink2MoeSmallBucketP {
+  uint T, K_top, E;
+};
+
+[[kernel]] void ink2_moe_bucket_small(const device uint* eid [[buffer(0)]], const device float* ew [[buffer(1)]],
+                                      device uint* tiles [[buffer(2)]], device uint* ntiles [[buffer(3)]],
+                                      device uint* st_tok [[buffer(4)]], device uint* st_pair [[buffer(5)]],
+                                      device float* st_ew [[buffer(6)]], constant Ink2MoeSmallBucketP& p [[buffer(7)]],
+                                      uint tid [[thread_index_in_threadgroup]]) {
+  threadgroup uint sh_off[4];
+  threadgroup uint sh_act[4];
+  threadgroup uint sh_eid[64];
+  threadgroup float sh_ew[64];
+  const uint r_tot = p.T * p.K_top;
+  if (r_tot <= 64u && tid < r_tot) {
+    sh_eid[tid] = eid[tid];
+    sh_ew[tid] = ew[tid];
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  uint count = 0;
+  if (tid < p.E) {
+    if (r_tot <= 64u) {
+      for (uint idx = 0; idx < r_tot; ++idx) count += (sh_eid[idx] == tid) ? 1u : 0u;
+    } else {
+      for (uint idx = 0; idx < r_tot; ++idx) count += (eid[idx] == tid) ? 1u : 0u;
+    }
+  }
+  const uint sg = tid >> 5, lane = tid & 31;
+  const uint p_excl = simd_prefix_exclusive_sum(count);
+  const uint p_sg = simd_sum(count);
+  const uint is_act = (count > 0u) ? 1u : 0u;
+  const uint e_excl = simd_prefix_exclusive_sum(is_act);
+  const uint e_sg = simd_sum(is_act);
+  if (lane == 31u) {
+    sh_off[sg] = p_sg;
+    sh_act[sg] = e_sg;
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  uint p_base = 0, e_base = 0;
+  for (uint s = 0; s < sg; ++s) {
+    p_base += sh_off[s];
+    e_base += sh_act[s];
+  }
+  const uint p_pos0 = p_base + p_excl;
+  const uint e_pos = e_base + e_excl;
+  if (is_act) {
+    tiles[e_pos * 3 + 0] = tid;
+    tiles[e_pos * 3 + 1] = p_pos0;
+    tiles[e_pos * 3 + 2] = count;
+    uint wp = p_pos0;
+    if (r_tot <= 64u) {
+      for (uint idx = 0; idx < r_tot; ++idx) {
+        if (sh_eid[idx] == tid) {
+          st_tok[wp] = idx / p.K_top;
+          st_pair[wp] = idx;
+          st_ew[wp] = sh_ew[idx];
+          ++wp;
+        }
+      }
+    } else {
+      for (uint idx = 0; idx < r_tot; ++idx) {
+        if (eid[idx] == tid) {
+          st_tok[wp] = idx / p.K_top;
+          st_pair[wp] = idx;
+          st_ew[wp] = ew[idx];
+          ++wp;
+        }
+      }
+    }
+  }
+  if (tid == 0u) ntiles[0] = sh_act[0] + sh_act[1] + sh_act[2] + sh_act[3];
+}
+
+[[kernel]] void ink2_moe_nvfp4_w13_g(const device float* x [[buffer(0)]], const device uchar* w13 [[buffer(1)]],
+                                     const device uchar* sc [[buffer(2)]], const device float* outer [[buffer(3)]],
+                                     const device uint* tiles [[buffer(4)]], const device uint* ntiles [[buffer(5)]],
+                                     const device uint* st_tok [[buffer(6)]], const device uint* st_pair [[buffer(7)]],
+                                     device float* act [[buffer(8)]], constant Ink2MoeP& p [[buffer(9)]],
+                                     uint2 tg [[threadgroup_position_in_grid]], uint sg [[simdgroup_index_in_threadgroup]],
+                                     uint lane [[thread_index_in_simdgroup]]) {
+  const uint j0 = (tg.x * 4u + sg) * 2u;
+  const uint eidx = tg.y;
+  if (j0 >= p.I || eidx >= ntiles[0]) return;
+  const bool has1 = (j0 + 1u) < p.I;
+  const uint e = tiles[eidx * 3 + 0];
+  const uint start = tiles[eidx * 3 + 1];
+  const uint count = tiles[eidx * 3 + 2];
+  const uint two_i = 2 * p.I;
+  const uint half_h = p.H / 2;
+  const uint blocks = p.H / 16;
+  const size_t wg0_row = size_t(e) * two_i + 2 * j0;
+  const size_t wu0_row = wg0_row + 1;
+  const size_t wg1_row = wg0_row + 2;
+  const size_t wu1_row = wg0_row + 3;
+  const float os = outer[e];
+
+  if (count == 1u) {
+    const uint tok = st_tok[start];
+    const uint pair = st_pair[start];
+    const device float* xp_base = x + size_t(tok) * p.H;
+    float ag0 = 0.0f, au0 = 0.0f, ag1 = 0.0f, au1 = 0.0f;
+    for (uint blk = lane; blk < blocks; blk += 32u) {
+      const uint kbase = blk * 16u;
+      const float4 x0 = *(const device float4*)(xp_base + kbase + 0u);
+      const float4 x1 = *(const device float4*)(xp_base + kbase + 4u);
+      const float4 x2 = *(const device float4*)(xp_base + kbase + 8u);
+      const float4 x3 = *(const device float4*)(xp_base + kbase + 12u);
+      {
+        const float sb = ink2_e4m3_16384(sc[wg0_row * blocks + blk]);
+        const uint2 wv = *(const device uint2*)(w13 + wg0_row * half_h + blk * 8u);
+        ag0 += (dot(x0, ink2_e2m1_4_raw(wv.x)) + dot(x1, ink2_e2m1_4_raw(wv.x >> 16)) +
+                dot(x2, ink2_e2m1_4_raw(wv.y)) + dot(x3, ink2_e2m1_4_raw(wv.y >> 16))) * sb;
+      }
+      {
+        const float sb = ink2_e4m3_16384(sc[wu0_row * blocks + blk]);
+        const uint2 wv = *(const device uint2*)(w13 + wu0_row * half_h + blk * 8u);
+        au0 += (dot(x0, ink2_e2m1_4_raw(wv.x)) + dot(x1, ink2_e2m1_4_raw(wv.x >> 16)) +
+                dot(x2, ink2_e2m1_4_raw(wv.y)) + dot(x3, ink2_e2m1_4_raw(wv.y >> 16))) * sb;
+      }
+      if (has1) {
+        {
+          const float sb = ink2_e4m3_16384(sc[wg1_row * blocks + blk]);
+          const uint2 wv = *(const device uint2*)(w13 + wg1_row * half_h + blk * 8u);
+          ag1 += (dot(x0, ink2_e2m1_4_raw(wv.x)) + dot(x1, ink2_e2m1_4_raw(wv.x >> 16)) +
+                  dot(x2, ink2_e2m1_4_raw(wv.y)) + dot(x3, ink2_e2m1_4_raw(wv.y >> 16))) * sb;
+        }
+        {
+          const float sb = ink2_e4m3_16384(sc[wu1_row * blocks + blk]);
+          const uint2 wv = *(const device uint2*)(w13 + wu1_row * half_h + blk * 8u);
+          au1 += (dot(x0, ink2_e2m1_4_raw(wv.x)) + dot(x1, ink2_e2m1_4_raw(wv.x >> 16)) +
+                  dot(x2, ink2_e2m1_4_raw(wv.y)) + dot(x3, ink2_e2m1_4_raw(wv.y >> 16))) * sb;
+        }
+      }
+    }
+    const float g0 = simd_sum(ag0) * os, u0 = simd_sum(au0) * os;
+    const float g1 = has1 ? simd_sum(ag1) * os : 0.0f;
+    const float u1 = has1 ? simd_sum(au1) * os : 0.0f;
+    if (lane == 0u) {
+      const size_t obase = size_t(pair) * p.I + j0;
+      act[obase] = (4.0f * metal::precise::tanh(g0 * 0.25f)) * (1.0f / (1.0f + metal::precise::exp(-g0))) *
+                   (25.0f * metal::precise::tanh(u0 * 0.04f));
+      if (has1) {
+        act[obase + 1u] = (4.0f * metal::precise::tanh(g1 * 0.25f)) * (1.0f / (1.0f + metal::precise::exp(-g1))) *
+                          (25.0f * metal::precise::tanh(u1 * 0.04f));
+      }
+    }
+    return;
+  }
+
+  for (uint p0 = 0; p0 < count; p0 += 4u) {
+    const uint mc = min(4u, count - p0);
+    uint toks[4];
+    float ag0[4], au0[4], ag1[4], au1[4];
+    for (uint m = 0; m < mc; ++m) {
+      toks[m] = st_tok[start + p0 + m];
+      ag0[m] = 0.0f; au0[m] = 0.0f; ag1[m] = 0.0f; au1[m] = 0.0f;
+    }
+    for (uint blk = lane; blk < blocks; blk += 32u) {
+      const uint kbase = blk * 16u;
+      float4 x0[4], x1[4], x2[4], x3[4];
+      for (uint m = 0; m < mc; ++m) {
+        const device float* xp = x + size_t(toks[m]) * p.H + kbase;
+        x0[m] = *(const device float4*)(xp + 0u);
+        x1[m] = *(const device float4*)(xp + 4u);
+        x2[m] = *(const device float4*)(xp + 8u);
+        x3[m] = *(const device float4*)(xp + 12u);
+      }
+      {
+        const float sb = ink2_e4m3_16384(sc[wg0_row * blocks + blk]);
+        const uint2 pw = *(const device uint2*)(w13 + wg0_row * half_h + blk * 8u);
+        const float4 w0 = ink2_e2m1_4_raw(pw.x), w1 = ink2_e2m1_4_raw(pw.x >> 16);
+        const float4 w2v = ink2_e2m1_4_raw(pw.y), w3 = ink2_e2m1_4_raw(pw.y >> 16);
+        for (uint m = 0; m < mc; ++m)
+          ag0[m] += (dot(x0[m], w0) + dot(x1[m], w1) + dot(x2[m], w2v) + dot(x3[m], w3)) * sb;
+      }
+      {
+        const float sb = ink2_e4m3_16384(sc[wu0_row * blocks + blk]);
+        const uint2 pw = *(const device uint2*)(w13 + wu0_row * half_h + blk * 8u);
+        const float4 w0 = ink2_e2m1_4_raw(pw.x), w1 = ink2_e2m1_4_raw(pw.x >> 16);
+        const float4 w2v = ink2_e2m1_4_raw(pw.y), w3 = ink2_e2m1_4_raw(pw.y >> 16);
+        for (uint m = 0; m < mc; ++m)
+          au0[m] += (dot(x0[m], w0) + dot(x1[m], w1) + dot(x2[m], w2v) + dot(x3[m], w3)) * sb;
+      }
+      if (has1) {
+        {
+          const float sb = ink2_e4m3_16384(sc[wg1_row * blocks + blk]);
+          const uint2 pw = *(const device uint2*)(w13 + wg1_row * half_h + blk * 8u);
+          const float4 w0 = ink2_e2m1_4_raw(pw.x), w1 = ink2_e2m1_4_raw(pw.x >> 16);
+          const float4 w2v = ink2_e2m1_4_raw(pw.y), w3 = ink2_e2m1_4_raw(pw.y >> 16);
+          for (uint m = 0; m < mc; ++m)
+            ag1[m] += (dot(x0[m], w0) + dot(x1[m], w1) + dot(x2[m], w2v) + dot(x3[m], w3)) * sb;
+        }
+        {
+          const float sb = ink2_e4m3_16384(sc[wu1_row * blocks + blk]);
+          const uint2 pw = *(const device uint2*)(w13 + wu1_row * half_h + blk * 8u);
+          const float4 w0 = ink2_e2m1_4_raw(pw.x), w1 = ink2_e2m1_4_raw(pw.x >> 16);
+          const float4 w2v = ink2_e2m1_4_raw(pw.y), w3 = ink2_e2m1_4_raw(pw.y >> 16);
+          for (uint m = 0; m < mc; ++m)
+            au1[m] += (dot(x0[m], w0) + dot(x1[m], w1) + dot(x2[m], w2v) + dot(x3[m], w3)) * sb;
+        }
+      }
+    }
+    for (uint m = 0; m < mc; ++m) {
+      const float g0 = simd_sum(ag0[m]) * os, u0 = simd_sum(au0[m]) * os;
+      const float g1 = has1 ? simd_sum(ag1[m]) * os : 0.0f;
+      const float u1 = has1 ? simd_sum(au1[m]) * os : 0.0f;
+      if (lane == 0u) {
+        const size_t obase = size_t(st_pair[start + p0 + m]) * p.I + j0;
+        act[obase] = (4.0f * metal::precise::tanh(g0 * 0.25f)) * (1.0f / (1.0f + metal::precise::exp(-g0))) *
+                     (25.0f * metal::precise::tanh(u0 * 0.04f));
+        if (has1) {
+          act[obase + 1u] = (4.0f * metal::precise::tanh(g1 * 0.25f)) * (1.0f / (1.0f + metal::precise::exp(-g1))) *
+                            (25.0f * metal::precise::tanh(u1 * 0.04f));
+        }
+      }
+    }
+  }
+}
+
+[[kernel]] void ink2_moe_nvfp4_w2_g(const device float* act [[buffer(0)]], const device uchar* w2 [[buffer(1)]],
+                                    const device uchar* sc [[buffer(2)]], const device float* outer [[buffer(3)]],
+                                    const device uint* tiles [[buffer(4)]], const device uint* ntiles [[buffer(5)]],
+                                    const device uint* st_pair [[buffer(6)]], const device float* st_ew [[buffer(7)]],
+                                    device float* pair_out [[buffer(8)]], constant Ink2MoeP& p [[buffer(9)]],
+                                    uint2 tg [[threadgroup_position_in_grid]], uint sg [[simdgroup_index_in_threadgroup]],
+                                    uint lane [[thread_index_in_simdgroup]]) {
+  const uint n0 = (tg.x * 4u + sg) * 4u;
+  const uint eidx = tg.y;
+  if (n0 >= p.H || eidx >= ntiles[0]) return;
+  const uint nr = min(4u, p.H - n0);
+  const uint e = tiles[eidx * 3 + 0];
+  const uint start = tiles[eidx * 3 + 1];
+  const uint count = tiles[eidx * 3 + 2];
+  const uint half_i = p.I / 2;
+  const uint blocks = p.I / 16;
+  const size_t wrow0 = size_t(e) * p.H + n0;
+  const float os = outer[e];
+
+  if (count == 1u) {
+    const uint pair = st_pair[start];
+    const float wos = st_ew[start] * os;
+    const device float* ap_base = act + size_t(pair) * p.I;
+    float s0 = 0.0f, s1 = 0.0f, s2 = 0.0f, s3 = 0.0f;
+    for (uint blk = lane; blk < blocks; blk += 32u) {
+      const uint kbase = blk * 16u;
+      const float4 a0 = *(const device float4*)(ap_base + kbase + 0u);
+      const float4 a1 = *(const device float4*)(ap_base + kbase + 4u);
+      const float4 a2 = *(const device float4*)(ap_base + kbase + 8u);
+      const float4 a3 = *(const device float4*)(ap_base + kbase + 12u);
+      {
+        const float sb = ink2_e4m3_16384(sc[wrow0 * blocks + blk]);
+        const uint2 pw = *(const device uint2*)(w2 + wrow0 * half_i + blk * 8u);
+        s0 += (dot(a0, ink2_e2m1_4_raw(pw.x)) + dot(a1, ink2_e2m1_4_raw(pw.x >> 16)) +
+               dot(a2, ink2_e2m1_4_raw(pw.y)) + dot(a3, ink2_e2m1_4_raw(pw.y >> 16))) * sb;
+      }
+      if (nr > 1u) {
+        const size_t r = wrow0 + 1u;
+        const float sb = ink2_e4m3_16384(sc[r * blocks + blk]);
+        const uint2 pw = *(const device uint2*)(w2 + r * half_i + blk * 8u);
+        s1 += (dot(a0, ink2_e2m1_4_raw(pw.x)) + dot(a1, ink2_e2m1_4_raw(pw.x >> 16)) +
+               dot(a2, ink2_e2m1_4_raw(pw.y)) + dot(a3, ink2_e2m1_4_raw(pw.y >> 16))) * sb;
+      }
+      if (nr > 2u) {
+        const size_t r = wrow0 + 2u;
+        const float sb = ink2_e4m3_16384(sc[r * blocks + blk]);
+        const uint2 pw = *(const device uint2*)(w2 + r * half_i + blk * 8u);
+        s2 += (dot(a0, ink2_e2m1_4_raw(pw.x)) + dot(a1, ink2_e2m1_4_raw(pw.x >> 16)) +
+               dot(a2, ink2_e2m1_4_raw(pw.y)) + dot(a3, ink2_e2m1_4_raw(pw.y >> 16))) * sb;
+      }
+      if (nr > 3u) {
+        const size_t r = wrow0 + 3u;
+        const float sb = ink2_e4m3_16384(sc[r * blocks + blk]);
+        const uint2 pw = *(const device uint2*)(w2 + r * half_i + blk * 8u);
+        s3 += (dot(a0, ink2_e2m1_4_raw(pw.x)) + dot(a1, ink2_e2m1_4_raw(pw.x >> 16)) +
+               dot(a2, ink2_e2m1_4_raw(pw.y)) + dot(a3, ink2_e2m1_4_raw(pw.y >> 16))) * sb;
+      }
+    }
+    const float r0 = wos * simd_sum(s0);
+    const float r1 = nr > 1u ? (wos * simd_sum(s1)) : 0.0f;
+    const float r2 = nr > 2u ? (wos * simd_sum(s2)) : 0.0f;
+    const float r3 = nr > 3u ? (wos * simd_sum(s3)) : 0.0f;
+    if (lane == 0u) {
+      device float* dst = pair_out + size_t(pair) * p.H + n0;
+      dst[0] = r0;
+      if (nr > 1u) dst[1] = r1;
+      if (nr > 2u) dst[2] = r2;
+      if (nr > 3u) dst[3] = r3;
+    }
+    return;
+  }
+
+  for (uint p0 = 0; p0 < count; p0 += 4u) {
+    const uint mc = min(4u, count - p0);
+    uint pairs[4];
+    float sum[4][4];
+    for (uint m = 0; m < mc; ++m) {
+      pairs[m] = st_pair[start + p0 + m];
+      sum[0][m] = 0.0f; sum[1][m] = 0.0f; sum[2][m] = 0.0f; sum[3][m] = 0.0f;
+    }
+    for (uint blk = lane; blk < blocks; blk += 32u) {
+      const uint kbase = blk * 16u;
+      float4 a0[4], a1[4], a2[4], a3[4];
+      for (uint m = 0; m < mc; ++m) {
+        const device float* ap = act + size_t(pairs[m]) * p.I + kbase;
+        a0[m] = *(const device float4*)(ap + 0u);
+        a1[m] = *(const device float4*)(ap + 4u);
+        a2[m] = *(const device float4*)(ap + 8u);
+        a3[m] = *(const device float4*)(ap + 12u);
+      }
+      for (uint q = 0u; q < nr; ++q) {
+        const size_t r = wrow0 + q;
+        const float sb = ink2_e4m3_16384(sc[r * blocks + blk]);
+        const uint2 pw = *(const device uint2*)(w2 + r * half_i + blk * 8u);
+        const float4 w0 = ink2_e2m1_4_raw(pw.x), w1 = ink2_e2m1_4_raw(pw.x >> 16);
+        const float4 w2v = ink2_e2m1_4_raw(pw.y), w3 = ink2_e2m1_4_raw(pw.y >> 16);
+        for (uint m = 0; m < mc; ++m)
+          sum[q][m] += (dot(a0[m], w0) + dot(a1[m], w1) + dot(a2[m], w2v) + dot(a3[m], w3)) * sb;
+      }
+    }
+    for (uint m = 0; m < mc; ++m) {
+      const float wos = st_ew[start + p0 + m] * os;
+      for (uint q = 0u; q < nr; ++q) {
+        const float rv = wos * simd_sum(sum[q][m]);
+        if (lane == 0u) pair_out[size_t(pairs[m]) * p.H + n0 + q] = rv;
+      }
+    }
+  }
+}
+
+[[kernel]] void ink2_moe_mxfp8_w13_g(const device float* x [[buffer(0)]], const device uchar* w13 [[buffer(1)]],
+                                     const device uchar* sc [[buffer(2)]], const device uint* tiles [[buffer(3)]],
+                                     const device uint* ntiles [[buffer(4)]], const device uint* st_tok [[buffer(5)]],
+                                     const device uint* st_pair [[buffer(6)]], device float* act [[buffer(7)]],
+                                     constant Ink2MoeP& p [[buffer(8)]], uint2 tg [[threadgroup_position_in_grid]],
+                                     uint sg [[simdgroup_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]]) {
+  const uint j0 = (tg.x * 4u + sg) * 2u;
+  const uint eidx = tg.y;
+  if (j0 >= p.I || eidx >= ntiles[0]) return;
+  const bool has1 = (j0 + 1u) < p.I;
+  const uint e = tiles[eidx * 3 + 0];
+  const uint start = tiles[eidx * 3 + 1];
+  const uint count = tiles[eidx * 3 + 2];
+  const uint two_i = 2 * p.I;
+  const uint blocks = p.H / 32;
+  const size_t wg0_row = size_t(e) * two_i + 2 * j0;
+  const size_t wu0_row = wg0_row + 1;
+  const size_t wg1_row = wg0_row + 2;
+  const size_t wu1_row = wg0_row + 3;
+
+  if (count == 1u) {
+    const uint tok = st_tok[start];
+    const uint pair = st_pair[start];
+    const device float* xp_base = x + size_t(tok) * p.H;
+    float ag0 = 0.0f, au0 = 0.0f, ag1 = 0.0f, au1 = 0.0f;
+    for (uint blk = lane; blk < blocks; blk += 32u) {
+      const uint kbase = blk * 32u;
+      const float4 x0 = *(const device float4*)(xp_base + kbase + 0u), x1 = *(const device float4*)(xp_base + kbase + 4u);
+      const float4 x2 = *(const device float4*)(xp_base + kbase + 8u), x3 = *(const device float4*)(xp_base + kbase + 12u);
+      const float4 x4 = *(const device float4*)(xp_base + kbase + 16u), x5 = *(const device float4*)(xp_base + kbase + 20u);
+      const float4 x6 = *(const device float4*)(xp_base + kbase + 24u), x7 = *(const device float4*)(xp_base + kbase + 28u);
+      auto dot32 = [&](size_t r) {
+        const float sb = ink2_ue8m0(sc[r * blocks + blk]);
+        const uint4 wa = *(const device uint4*)(w13 + r * p.H + kbase + 0u);
+        const uint4 wb = *(const device uint4*)(w13 + r * p.H + kbase + 16u);
+        return (dot(x0, ink2_e4m3_4(wa.x)) + dot(x1, ink2_e4m3_4(wa.y)) +
+                dot(x2, ink2_e4m3_4(wa.z)) + dot(x3, ink2_e4m3_4(wa.w)) +
+                dot(x4, ink2_e4m3_4(wb.x)) + dot(x5, ink2_e4m3_4(wb.y)) +
+                dot(x6, ink2_e4m3_4(wb.z)) + dot(x7, ink2_e4m3_4(wb.w))) * sb;
+      };
+      ag0 += dot32(wg0_row);
+      au0 += dot32(wu0_row);
+      if (has1) {
+        ag1 += dot32(wg1_row);
+        au1 += dot32(wu1_row);
+      }
+    }
+    const float g0 = simd_sum(ag0), u0 = simd_sum(au0);
+    const float g1 = has1 ? simd_sum(ag1) : 0.0f;
+    const float u1 = has1 ? simd_sum(au1) : 0.0f;
+    if (lane == 0u) {
+      const size_t obase = size_t(pair) * p.I + j0;
+      act[obase] = (4.0f * metal::precise::tanh(g0 * 0.25f)) * (1.0f / (1.0f + metal::precise::exp(-g0))) *
+                   (25.0f * metal::precise::tanh(u0 * 0.04f));
+      if (has1) {
+        act[obase + 1u] = (4.0f * metal::precise::tanh(g1 * 0.25f)) * (1.0f / (1.0f + metal::precise::exp(-g1))) *
+                          (25.0f * metal::precise::tanh(u1 * 0.04f));
+      }
+    }
+    return;
+  }
+
+  for (uint p0 = 0; p0 < count; p0 += 4u) {
+    const uint mc = min(4u, count - p0);
+    uint toks[4];
+    float ag0[4], au0[4], ag1[4], au1[4];
+    for (uint m = 0; m < mc; ++m) {
+      toks[m] = st_tok[start + p0 + m];
+      ag0[m] = 0.0f; au0[m] = 0.0f; ag1[m] = 0.0f; au1[m] = 0.0f;
+    }
+    for (uint blk = lane; blk < blocks; blk += 32u) {
+      const uint kbase = blk * 32u;
+      auto accum_row = [&](size_t r, thread float* acc) {
+        const float sb = ink2_ue8m0(sc[r * blocks + blk]);
+        const uint4 wa = *(const device uint4*)(w13 + r * p.H + kbase + 0u);
+        const uint4 wb = *(const device uint4*)(w13 + r * p.H + kbase + 16u);
+        const float4 w0 = ink2_e4m3_4(wa.x), w1 = ink2_e4m3_4(wa.y);
+        const float4 w2v = ink2_e4m3_4(wa.z), w3 = ink2_e4m3_4(wa.w);
+        const float4 w4 = ink2_e4m3_4(wb.x), w5 = ink2_e4m3_4(wb.y);
+        const float4 w6 = ink2_e4m3_4(wb.z), w7 = ink2_e4m3_4(wb.w);
+        for (uint m = 0; m < mc; ++m) {
+          const device float* xp = x + size_t(toks[m]) * p.H + kbase;
+          const float4 x0 = *(const device float4*)(xp + 0u), x1 = *(const device float4*)(xp + 4u);
+          const float4 x2 = *(const device float4*)(xp + 8u), x3 = *(const device float4*)(xp + 12u);
+          const float4 x4 = *(const device float4*)(xp + 16u), x5 = *(const device float4*)(xp + 20u);
+          const float4 x6 = *(const device float4*)(xp + 24u), x7 = *(const device float4*)(xp + 28u);
+          acc[m] += (dot(x0, w0) + dot(x1, w1) + dot(x2, w2v) + dot(x3, w3) +
+                     dot(x4, w4) + dot(x5, w5) + dot(x6, w6) + dot(x7, w7)) * sb;
+        }
+      };
+      accum_row(wg0_row, ag0);
+      accum_row(wu0_row, au0);
+      if (has1) {
+        accum_row(wg1_row, ag1);
+        accum_row(wu1_row, au1);
+      }
+    }
+    for (uint m = 0; m < mc; ++m) {
+      const float g0 = simd_sum(ag0[m]), u0 = simd_sum(au0[m]);
+      const float g1 = has1 ? simd_sum(ag1[m]) : 0.0f;
+      const float u1 = has1 ? simd_sum(au1[m]) : 0.0f;
+      if (lane == 0u) {
+        const size_t obase = size_t(st_pair[start + p0 + m]) * p.I + j0;
+        act[obase] = (4.0f * metal::precise::tanh(g0 * 0.25f)) * (1.0f / (1.0f + metal::precise::exp(-g0))) *
+                     (25.0f * metal::precise::tanh(u0 * 0.04f));
+        if (has1) {
+          act[obase + 1u] = (4.0f * metal::precise::tanh(g1 * 0.25f)) * (1.0f / (1.0f + metal::precise::exp(-g1))) *
+                            (25.0f * metal::precise::tanh(u1 * 0.04f));
+        }
+      }
+    }
+  }
+}
+
+[[kernel]] void ink2_moe_mxfp8_w2_g(const device float* act [[buffer(0)]], const device uchar* w2 [[buffer(1)]],
+                                    const device uchar* sc [[buffer(2)]], const device uint* tiles [[buffer(3)]],
+                                    const device uint* ntiles [[buffer(4)]], const device uint* st_pair [[buffer(5)]],
+                                    const device float* st_ew [[buffer(6)]], device float* pair_out [[buffer(7)]],
+                                    constant Ink2MoeP& p [[buffer(8)]], uint2 tg [[threadgroup_position_in_grid]],
+                                    uint sg [[simdgroup_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]]) {
+  const uint n0 = (tg.x * 4u + sg) * 4u;
+  const uint eidx = tg.y;
+  if (n0 >= p.H || eidx >= ntiles[0]) return;
+  const uint nr = min(4u, p.H - n0);
+  const uint e = tiles[eidx * 3 + 0];
+  const uint start = tiles[eidx * 3 + 1];
+  const uint count = tiles[eidx * 3 + 2];
+  const uint blocks = p.I / 32;
+  const size_t wrow0 = size_t(e) * p.H + n0;
+
+  if (count == 1u) {
+    const uint pair = st_pair[start];
+    const float ew_m = st_ew[start];
+    const device float* ap_base = act + size_t(pair) * p.I;
+    float s0 = 0.0f, s1 = 0.0f, s2 = 0.0f, s3 = 0.0f;
+    for (uint blk = lane; blk < blocks; blk += 32u) {
+      const uint kbase = blk * 32u;
+      const float4 a0 = *(const device float4*)(ap_base + kbase + 0u), a1 = *(const device float4*)(ap_base + kbase + 4u);
+      const float4 a2 = *(const device float4*)(ap_base + kbase + 8u), a3 = *(const device float4*)(ap_base + kbase + 12u);
+      const float4 a4 = *(const device float4*)(ap_base + kbase + 16u), a5 = *(const device float4*)(ap_base + kbase + 20u);
+      const float4 a6 = *(const device float4*)(ap_base + kbase + 24u), a7 = *(const device float4*)(ap_base + kbase + 28u);
+      auto dot32 = [&](size_t r) {
+        const float sb = ink2_ue8m0(sc[r * blocks + blk]);
+        const uint4 wa = *(const device uint4*)(w2 + r * p.I + kbase + 0u);
+        const uint4 wb = *(const device uint4*)(w2 + r * p.I + kbase + 16u);
+        return (dot(a0, ink2_e4m3_4(wa.x)) + dot(a1, ink2_e4m3_4(wa.y)) +
+                dot(a2, ink2_e4m3_4(wa.z)) + dot(a3, ink2_e4m3_4(wa.w)) +
+                dot(a4, ink2_e4m3_4(wb.x)) + dot(a5, ink2_e4m3_4(wb.y)) +
+                dot(a6, ink2_e4m3_4(wb.z)) + dot(a7, ink2_e4m3_4(wb.w))) * sb;
+      };
+      s0 += dot32(wrow0);
+      if (nr > 1u) s1 += dot32(wrow0 + 1u);
+      if (nr > 2u) s2 += dot32(wrow0 + 2u);
+      if (nr > 3u) s3 += dot32(wrow0 + 3u);
+    }
+    const float r0 = ew_m * simd_sum(s0);
+    const float r1 = nr > 1u ? (ew_m * simd_sum(s1)) : 0.0f;
+    const float r2 = nr > 2u ? (ew_m * simd_sum(s2)) : 0.0f;
+    const float r3 = nr > 3u ? (ew_m * simd_sum(s3)) : 0.0f;
+    if (lane == 0u) {
+      device float* dst = pair_out + size_t(pair) * p.H + n0;
+      dst[0] = r0;
+      if (nr > 1u) dst[1] = r1;
+      if (nr > 2u) dst[2] = r2;
+      if (nr > 3u) dst[3] = r3;
+    }
+    return;
+  }
+
+  for (uint p0 = 0; p0 < count; p0 += 4u) {
+    const uint mc = min(4u, count - p0);
+    uint pairs[4];
+    float sum[4][4];
+    for (uint m = 0; m < mc; ++m) {
+      pairs[m] = st_pair[start + p0 + m];
+      sum[0][m] = 0.0f; sum[1][m] = 0.0f; sum[2][m] = 0.0f; sum[3][m] = 0.0f;
+    }
+    for (uint blk = lane; blk < blocks; blk += 32u) {
+      const uint kbase = blk * 32u;
+      for (uint q = 0u; q < nr; ++q) {
+        const size_t r = wrow0 + q;
+        const float sb = ink2_ue8m0(sc[r * blocks + blk]);
+        const uint4 wa = *(const device uint4*)(w2 + r * p.I + kbase + 0u);
+        const uint4 wb = *(const device uint4*)(w2 + r * p.I + kbase + 16u);
+        const float4 w0 = ink2_e4m3_4(wa.x), w1 = ink2_e4m3_4(wa.y);
+        const float4 w2v = ink2_e4m3_4(wa.z), w3 = ink2_e4m3_4(wa.w);
+        const float4 w4 = ink2_e4m3_4(wb.x), w5 = ink2_e4m3_4(wb.y);
+        const float4 w6 = ink2_e4m3_4(wb.z), w7 = ink2_e4m3_4(wb.w);
+        for (uint m = 0; m < mc; ++m) {
+          const device float* ap = act + size_t(pairs[m]) * p.I + kbase;
+          const float4 a0 = *(const device float4*)(ap + 0u), a1 = *(const device float4*)(ap + 4u);
+          const float4 a2 = *(const device float4*)(ap + 8u), a3 = *(const device float4*)(ap + 12u);
+          const float4 a4 = *(const device float4*)(ap + 16u), a5 = *(const device float4*)(ap + 20u);
+          const float4 a6 = *(const device float4*)(ap + 24u), a7 = *(const device float4*)(ap + 28u);
+          sum[q][m] += (dot(a0, w0) + dot(a1, w1) + dot(a2, w2v) + dot(a3, w3) +
+                        dot(a4, w4) + dot(a5, w5) + dot(a6, w6) + dot(a7, w7)) * sb;
+        }
+      }
+    }
+    for (uint m = 0; m < mc; ++m) {
+      const float ew_m = st_ew[start + p0 + m];
+      for (uint q = 0u; q < nr; ++q) {
+        const float rv = ew_m * simd_sum(sum[q][m]);
+        if (lane == 0u) pair_out[size_t(pairs[m]) * p.H + n0 + q] = rv;
+      }
+    }
+  }
+}
+
+[[kernel]] void ink2_moe_reduce8_m3(const device float4* pair_out [[buffer(0)]], device float4* out [[buffer(1)]],
+                                    constant Ink2MoeP& p [[buffer(2)]], uint2 gid [[thread_position_in_grid]]) {
+  const uint h4 = p.H >> 2;
+  const uint col = gid.x, t = gid.y;
+  if (col >= h4) return;
+  float4 acc = float4(0.0f);
+  for (uint k = 0; k < p.K_top; ++k) acc += pair_out[size_t(t * p.K_top + k) * h4 + col];
+  out[size_t(t) * h4 + col] = acc;
 }

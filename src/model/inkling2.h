@@ -17,6 +17,8 @@
 
 namespace ni {
 
+class Ink2Mtp;
+
 struct Ink2Config {
   int hidden = 2304;
   int num_layers = 24;
@@ -101,12 +103,15 @@ class Inkling2 : public Model {
   bool grouped_passes() const override { return true; }
   bool use_tensor() const { return use_tensor_; }
   void set_use_tensor(bool on);
+  bool has_mtp() const { return mtp_ != nullptr; }
+  int mtp_block() const;
+  void disable_mtp();
 
   void set_mem_budget(size_t bytes) override { mem_budget_ = bytes; }
   std::unique_ptr<Seq> new_seq(int limit, int initial = -1) override;
   bool reserve(Seq& s, int need) override;
   void drop_kv(Seq& s) override;
-  size_t kv_bytes_per_pos() const override { return kv_per_pos(cfg_); }
+  size_t kv_bytes_per_pos() const override;
   void reset(Seq& s) override;
   Checkpoint new_checkpoint() override;
   void save(Encoder& e, const Seq& s, Checkpoint& c, int pos) override;
@@ -116,21 +121,31 @@ class Inkling2 : public Model {
   void encode_prefill(Encoder& e, Seq& s, int pos0, int T, const SamplingParams& sp, uint32_t step, bool sample,
                       Checkpoint* snap = nullptr, int snap_row = 0) override;
 
+  // MTP speculative decoding
+  void encode_mtp_draft(Encoder& e, Seq& s, int P, int K, const SamplingParams& sp, uint32_t step);
+  void encode_mtp_verify(Encoder& e, Seq& s, int P, int R, const SamplingParams& sp, uint32_t step);
+  int accept_mtp(Seq& s, int P, int K, const SamplingParams& sp, uint32_t step) const;
+  void encode_mtp_commit(Encoder& e, Seq& s, int pos0, int m);
+
   // Diagnostic helpers (tools/ink2_check)
   float* logits() { return logits_.as<float>(); }
   Buffer logits_buf() const { return logits_; }
+  Buffer verify_logits_buf() const { return verify_logits_; }
   void encode_logits_rows(Encoder& e, Seq& s, int pos0, int T, const Buffer& out);
   void encode_prefill_diag(Encoder& e, Seq& s, int pos0, int T, const Buffer& diag_rows);
   int debug_tensor_unit_check();
 
  private:
+  friend class Ink2Mtp;
   void load();
   void alloc_buffers();
   bool ensure_rings(Seq& s);
+  bool is_swa_slot(size_t slot) const;
   void enc_forward(Encoder& e, Seq& s, int pos0, int T, bool dump_logits, const Buffer* out_logits, bool need_all_logits,
-                   const Buffer* diag_rows = nullptr);
+                   const Buffer* diag_rows = nullptr, bool capture_taps = false, bool save_conv_snaps = false);
   void enc_mm(Encoder& e, const Tensor& w, const Buffer& x, const Buffer& y, int M, uint32_t N_limit = 0, bool add = false,
               bool exact_f32 = false);
+  void enc_unembed(Encoder& e, const Buffer& x, const Buffer& y, int M, bool apply_softcap);
   void enc_norm(Encoder& e, const Buffer& x, const Tensor* w, const Buffer& out, int T, uint32_t dim);
   void enc_attn_res(Encoder& e, const Buffer* const* states, int M, const void* query_ptr, bool q_f32, uint32_t Q,
                     const Buffer& out, int T);
@@ -170,6 +185,8 @@ class Inkling2 : public Model {
   Buffer h_mlp_, x_mlp_, rlog_, eid_, ew_, moe_act_, moe_out_;
   Buffer moe_tiles_, moe_ntiles_, moe_st_tok_, moe_st_pair_, moe_st_ew_, moe_pair_out_;
   Buffer logits_, cand_v_, cand_i_, sprob_, samp_;
+  std::unique_ptr<Ink2Mtp> mtp_;
+  Buffer tap_[3], verify_conv_, verify_logits_, verify_samples_;
 };
 
 }  // namespace ni

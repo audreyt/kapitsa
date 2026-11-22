@@ -158,6 +158,103 @@ int main(int argc, char** argv) {
     printf("RUN T96_tensor_ab:\n");
     fails += model.debug_tensor_unit_check();
   }
+  if (model.has_mtp()) {
+    const auto& p0 = golden.at("prompts").at(0);
+    const std::vector<int> pids0 = p0.at("ids").get<std::vector<int>>();
+    const std::vector<int> g24 = p0.at("greedy_24").get<std::vector<int>>();
+    auto run_mtp_rollout = [&](const char* label, const std::vector<int>& prompt, const std::vector<int>& want_toks, int K,
+                               ni::SamplingParams sp, std::vector<int>* out_toks = nullptr) -> bool {
+      auto seq = model.new_seq(512, 512);
+      const int n = int(prompt.size());
+      for (int i = 0; i < n; ++i) seq->tokens()[i] = prompt[i];
+      auto e = gpu.begin_grouped();
+      model.encode_prefill(*e, *seq, 0, n, sp, 0, true);
+      e->commit_and_wait();
+      std::vector<int> gen;
+      gen.push_back(seq->tokens()[n]);
+      int P = n;
+      int cyc = 0;
+      while (int(gen.size()) < int(want_toks.size()) && P + K + 2 < seq->cap) {
+        auto ec = gpu.begin_grouped();
+        model.encode_mtp_draft(*ec, *seq, P, K, sp, uint32_t(P));
+        model.encode_mtp_verify(*ec, *seq, P, K + 1, sp, uint32_t(P));
+        ec->commit_and_wait();
+        const int a = model.accept_mtp(*seq, P, K, sp, uint32_t(P));
+        const int m = a + 1;
+        auto em = gpu.begin_grouped();
+        model.encode_mtp_commit(*em, *seq, P, m);
+        em->commit_and_wait();
+        for (int i = 1; i <= m && int(gen.size()) < int(want_toks.size()); ++i) gen.push_back(seq->tokens()[P + i]);
+        P += m;
+        ++cyc;
+      }
+      int match = 0;
+      const int total = int(want_toks.size());
+      for (int i = 0; i < total && i < int(gen.size()); ++i) {
+        if (gen[size_t(i)] == want_toks[size_t(i)]) ++match;
+      }
+      bool ok = (match == total);
+      if (sp.temperature > 0.0f) {
+        ok = (int(gen.size()) == total);
+        for (int t : gen) {
+          if (t < 0 || t >= model.vocab()) ok = false;
+        }
+        printf("%s %s: K=%d valid=%zu/%d cycles=%d (%.2f tok/cyc)\n", ok ? "PASS" : "FAIL", label, K, gen.size(),
+               total, cyc, cyc > 0 ? double(gen.size() - 1) / cyc : 0.0);
+      } else {
+        printf("%s %s: K=%d match=%d/%d cycles=%d (%.2f tok/cyc)\n", ok ? "PASS" : "FAIL", label, K, match, total, cyc,
+               cyc > 0 ? double(gen.size() - 1) / cyc : 0.0);
+      }
+      if (out_toks) *out_toks = gen;
+      return ok;
+    };
+
+    for (int K : {3, 5, 7}) {
+      char lbl[32];
+      snprintf(lbl, sizeof lbl, "mtp_greedy_K%d", K);
+      if (!run_mtp_rollout(lbl, pids0, g24, K, greedy)) ++fails;
+    }
+
+    // Longer prefix (96 tokens -> triggers KV > 64 split-K attention) plain vs MTP greedy K=5
+    {
+      std::vector<int> p96;
+      p96.reserve(96);
+      while (int(p96.size()) < 96) {
+        for (int id : pids0) {
+          if (int(p96.size()) < 96) p96.push_back(id);
+        }
+      }
+      auto ref_seq = model.new_seq(512, 512);
+      for (int i = 0; i < 96; ++i) ref_seq->tokens()[i] = p96[size_t(i)];
+      auto ep = gpu.begin_grouped();
+      model.encode_prefill(*ep, *ref_seq, 0, 96, greedy, 0, true);
+      ep->commit_and_wait();
+      std::vector<int> ref24 = {ref_seq->tokens()[96]};
+      for (int step = 1; step < 24; ++step) {
+        auto es = gpu.begin_grouped();
+        model.encode_step(*es, *ref_seq, 96 + step - 1, greedy, uint32_t(step), true);
+        es->commit_and_wait();
+        ref24.push_back(ref_seq->tokens()[96 + step]);
+      }
+      if (!run_mtp_rollout("mtp_pos96_splitk_K5", p96, ref24, 5, greedy)) ++fails;
+    }
+
+    // Sampled lossless rejection sampling determinism + valid outputs
+    {
+      ni::SamplingParams sp;
+      sp.temperature = 0.7f;
+      sp.top_k = 40;
+      sp.top_p = 0.95f;
+      sp.seed = 12345u;
+      std::vector<int> s1, s2;
+      const std::vector<int> dummy(24, 0);
+      bool ok1 = run_mtp_rollout("mtp_sampled_T0.7_a", pids0, dummy, 5, sp, &s1);
+      bool ok2 = run_mtp_rollout("mtp_sampled_T0.7_b", pids0, dummy, 5, sp, &s2);
+      const bool det = ok1 && ok2 && (s1 == s2);
+      printf("%s mtp_sampled_deterministic: %zu tokens match\n", det ? "PASS" : "FAIL", s1.size());
+      if (!det) ++fails;
+    }
+  }
   if (ni::Encoder::profiling()) ni::Encoder::profile_report(1);
   return fails ? 1 : 0;
 }

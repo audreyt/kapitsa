@@ -30,6 +30,7 @@
 #include "model/hy4_flash.h"
 #include "model/moe_a4.h"
 #include "model/inkling2.h"
+#include "model/ink2_mtp.h"
 #include "model/token_suppression.h"
 #include "tokenizer/tokenizer.h"
 #include "util/log.h"
@@ -3322,6 +3323,99 @@ void hy4_plan_unit() {
   }
 }
 
+void ink2_mtp_accept_unit() {
+  // 1. Greedy acceptance boundary conditions (all accept, early mismatch, index-0 mismatch)
+  {
+    const int P = 10, K = 4, V = 8;
+    std::vector<int> tok(P + K + 2, 0);
+    tok[P + 1] = 2;
+    tok[P + 2] = 5;
+    tok[P + 3] = 1;
+    tok[P + 4] = 7;
+    std::vector<float> dummy_logits(size_t(K + 1) * V, 0.0f);
+    SamplingParams sp;
+    sp.temperature = 0.0f;
+
+    std::vector<int> vs = {2, 5, 1, 7, 3};
+    std::vector<int> t1 = tok;
+    int a1 = ink2_mtp_accept_cpu(t1.data(), P, K, V, dummy_logits.data(), dummy_logits.data(), vs.data(), sp, 10u);
+    check(a1 == 4 && t1[P + 5] == 3, "ink2_mtp_accept: greedy all accept", std::to_string(a1));
+
+    vs = {2, 5, 4, 7, 3};
+    std::vector<int> t2 = tok;
+    int a2 = ink2_mtp_accept_cpu(t2.data(), P, K, V, dummy_logits.data(), dummy_logits.data(), vs.data(), sp, 10u);
+    check(a2 == 2 && t2[P + 3] == 4, "ink2_mtp_accept: greedy mid reject", std::to_string(a2));
+
+    vs = {6, 5, 1, 7, 3};
+    std::vector<int> t3 = tok;
+    int a3 = ink2_mtp_accept_cpu(t3.data(), P, K, V, dummy_logits.data(), dummy_logits.data(), vs.data(), sp, 10u);
+    check(a3 == 0 && t3[P + 1] == 6, "ink2_mtp_accept: greedy index-0 reject", std::to_string(a3));
+  }
+
+  // 2. Lossless rejection sampling parity: p == q always accepts all K drafts
+  {
+    const int P = 4, K = 3, V = 6;
+    std::vector<float> vlogits(size_t(K + 1) * V, 0.0f);
+    std::vector<float> dlogits(size_t(K) * V, 0.0f);
+    for (int r = 0; r < K; ++r) {
+      for (int v = 0; v < V; ++v) vlogits[size_t(r) * V + v] = dlogits[size_t(r) * V + v] = 0.3f * float(v);
+    }
+    SamplingParams sp;
+    sp.temperature = 1.0f;
+    sp.top_k = 0;
+    sp.top_p = 1.0f;
+    std::vector<int> vs = {1, 2, 3, 5};
+    for (uint32_t seed = 1; seed <= 64; ++seed) {
+      sp.seed = seed * 17u;
+      std::vector<int> tok(P + K + 2, 0);
+      tok[P + 1] = 2;
+      tok[P + 2] = 4;
+      tok[P + 3] = 5;
+      int a = ink2_mtp_accept_cpu(tok.data(), P, K, V, vlogits.data(), dlogits.data(), vs.data(), sp, 7u);
+      check(a == K && tok[P + 1 + K] == 5, "ink2_mtp_accept: identical p==q accepts all");
+    }
+  }
+
+  // 3. Rejection acceptance rate & residual distribution exactness (verifies independent u_res salt)
+  {
+    const int P = 0, K = 1, V = 3;
+    const std::vector<float> dlogits = {std::log(0.80f), std::log(0.10f), std::log(0.10f)};
+    std::vector<float> vlogits(2 * V, 0.0f);
+    vlogits[0] = std::log(0.40f);
+    vlogits[1] = std::log(0.45f);
+    vlogits[2] = std::log(0.15f);
+    SamplingParams sp;
+    sp.temperature = 1.0f;
+    sp.top_k = 0;
+    sp.top_p = 1.0f;
+    const std::vector<int> vs = {0, 0};
+
+    const int N = 6000;
+    int accepts = 0;
+    int res_counts[3] = {0, 0, 0};
+    for (int i = 0; i < N; ++i) {
+      sp.seed = uint32_t(i + 1) * 2654435761u;
+      std::vector<int> tok = {0, 0, 0};
+      int a = ink2_mtp_accept_cpu(tok.data(), P, K, V, vlogits.data(), dlogits.data(), vs.data(), sp, 42u);
+      if (a == 1) {
+        ++accepts;
+      } else {
+        check(tok[1] >= 0 && tok[1] < 3, "ink2_mtp_accept: valid residual token");
+        ++res_counts[tok[1]];
+      }
+    }
+    const double acc_rate = double(accepts) / N;
+    const int rejects = N - accepts;
+    const double r0 = double(res_counts[0]) / rejects;
+    const double r1 = double(res_counts[1]) / rejects;
+    const double r2 = double(res_counts[2]) / rejects;
+    check(std::fabs(acc_rate - 0.5) < 0.03 && r0 == 0.0 && std::fabs(r1 - 0.875) < 0.03 &&
+              std::fabs(r2 - 0.125) < 0.03,
+          "ink2_mtp_accept: unbiased accept + residual",
+          "acc=" + std::to_string(acc_rate) + " r1=" + std::to_string(r1) + " r2=" + std::to_string(r2));
+  }
+}
+
 void inkling2_unit() {
   // 1. render_inkling2_chat() exact parity against Jinja2 chat_template.jinja renderings
   {
@@ -3694,6 +3788,7 @@ int main(int argc, char** argv) {
   unsupported_model_unit();
   clover_unit();
   inkling2_unit();
+  ink2_mtp_accept_unit();
   norm_layout_unit();
   ollama_unit();
   drafter_report_unit();
