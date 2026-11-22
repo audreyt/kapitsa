@@ -4814,8 +4814,11 @@ ChatResult Engine::chat(const ChatRequest& r_in, const std::function<bool(const 
         }
         K = std::min(k_cur, s.cap - P - 2);
       }
-      flush_pending();
       auto e2 = g.begin_grouped();
+      if (pend_m > 0) {
+        ink2_->encode_mtp_commit(*e2, s, pend_p0, pend_m);
+        pend_m = 0;
+      }
       ink2_->encode_mtp_draft(*e2, s, P, K, sp, uint32_t(P));
       ink2_->encode_mtp_verify(*e2, s, P, K + 1, sp, uint32_t(P));
       e2->commit_and_wait();
