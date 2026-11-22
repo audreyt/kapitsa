@@ -1,7 +1,9 @@
 #include "model/ink2_dflare.h"
 
 #include "model/inkling2_kernels.h"
+#include "model/kparams.h"
 #include "model/nemotron_h.h"
+#include "model/sampler.h"
 #include "util/bf16.h"
 #include "util/json_file.h"
 #include "util/log.h"
@@ -35,6 +37,16 @@ Pipeline dfl_pipe(const std::string& name) {
   return cache.emplace(name, p).first->second;
 }
 
+template <class P>
+void run_k(Encoder& e, const std::string& name, std::initializer_list<Buffer> bufs, const P& p,
+           uint32_t gx, uint32_t gy, uint32_t tx) {
+  e.use(dfl_pipe(name));
+  int i = 0;
+  for (const Buffer& b : bufs) e.buf(i++, b);
+  e.val(i, p);
+  e.dispatch(gx, gy, 1, tx);
+}
+
 struct DflMixP {
   uint32_t R, H, row_off, total_rows;
   float a0, a1, a2, a3, eps;
@@ -58,12 +70,6 @@ struct DflAttnP {
   uint32_t B, Hq, Hkv, D, pos0, ctx_len, ctx_cap;
   float scale;
 };
-struct DflSwigluP {
-  uint32_t n;
-};
-struct DflTopkP {
-  uint32_t V, K;
-};
 struct DflMarkovP {
   uint32_t R, H, K, step, tok_prev_idx, tok_out_idx;
   float softcap, inv_softcap;
@@ -72,8 +78,17 @@ struct Ink2NormP {
   uint32_t T, H, has_w, w_f32;
   float eps;
 };
+struct DflQ8MvP { uint32_t M, N, K, nblk, add; };
+struct DflQ8Multi3P { uint32_t M, K, N_tot, nblk; uint32_t offs[4]; };
+struct DflQuantP { uint32_t total_blocks, w_f32; };
+struct DflP2BaseP { uint32_t M, V, H, nblk; };
+struct DflP2ScreenP { uint32_t V, R, has_sup, sup_words; };
+struct DflRescoreP { uint32_t V, H, R, u_f32, has_sup, sup_words; };
+struct DflArgmaxP { uint32_t tok_out_idx; };
+struct DflAccP { uint32_t pos, K; };
 
 constexpr int kCommitBatch = 64;
+constexpr uint32_t kShortlistK = 128;
 
 }  // namespace
 
@@ -101,8 +116,21 @@ Ink2DFlare::Ink2DFlare(Inkling2& target, const std::string& dir) : tg_(target), 
   block_size_ = m.value("block_size", 8);
   ctx_cap_ = std::max(1, m.value("sliding_window_size", 1024) - 1);
   rank_ = m.value("markov_rank", 256);
+  if ((H_ % 32) != 0 || (I_ % 32) != 0 || rank_ != 256 || block_size_ - 1 > kMaxDrafts)
+    fatal("ink2_dflare: unsupported shape H=%d I=%d rank=%d block=%d", H_, I_, rank_, block_size_);
 
   ink2::compile_kernels();
+  if (const char* v = getenv("NI_PREWARM"); !(v && !strcmp(v, "0"))) {
+    static const char* const kDflNames[] = {
+        "dflare_mix_norm", "dflare_q8_mm", "dflare_ctx_kv_write", "dflare_build_block", "dflare_qk_rope",
+        "dflare_attn", "dflare_markov_concat", "dflare_markov_gru", "dflare_fold_mm_q8",
+        "dflare_quant_q8_bf16", "dflare_quant_p2_w", "dflare_q8_mv8", "dflare_q8_mv8_multi3",
+        "dflare_q8_gate_up_swiglu8", "dflare_p2_unembed_base", "dflare_p2_fold_screen", "dflare_rescore_exact",
+        "dflare_argmax_128", "dflare_accept_samples",
+    };
+    for (const char* k : kDflNames) (void)dfl_pipe(k);
+    for (const char* k : {"topk_stage1_rows_sg", "sample_stage2_rows", "sample_full"}) (void)Gpu::get().pipeline(k);
+  }
   load();
   alloc_buffers();
   Gpu::get().make_resident(owned_bufs_);
@@ -125,11 +153,11 @@ void Ink2DFlare::load() {
     if (!t) fatal("ink2_dflare: missing tensor %s in mtp.safetensors", name.c_str());
     return *t;
   };
-  auto to_f32_buf = [&](const std::string& name, const char* lbl) -> Buffer {
+  auto to_f32_buf = [&](const std::string& name, const char* lbl, bool own = true) -> Buffer {
     const Tensor& t = req(name);
     const size_t n = size_t(t.numel());
     Buffer b = g.alloc(n * 4, lbl);
-    owned_bufs_.push_back(b);
+    if (own) owned_bufs_.push_back(b);
     float* dst = b.as<float>();
     if (t.dtype == DType::F32) {
       memcpy(dst, t.buf.ptr(), n * 4);
@@ -152,7 +180,32 @@ void Ink2DFlare::load() {
   };
 
   const unsigned nthr = std::max(1u, std::min(12u, std::thread::hardware_concurrency()));
-  size_t q8_bytes = 0;
+  size_t w_bytes = 0;
+  auto e = g.begin();
+  auto pack_q8 = [&](std::initializer_list<const char*> names) -> Q8Mat {
+    uint32_t N = 0, K = 0;
+    std::vector<const Tensor*> ts;
+    for (const char* nm : names) {
+      const Tensor& t = req(nm);
+      if (t.shape.size() != 2 || t.dtype != DType::BF16) fatal("ink2_dflare: expected 2D BF16 for %s", nm);
+      ts.push_back(&t);
+      N += uint32_t(t.shape[0]); K = uint32_t(t.shape[1]);
+    }
+    const size_t nblk = size_t(N) * (K / 32u), srow = size_t(K / 32u) * 2u;
+    Q8Mat m{g.alloc(size_t(N) * K, "dfl_q8_q"), g.alloc(nblk * 2u, "dfl_q8_s"), N, K};
+    owned_bufs_.push_back(m.q); owned_bufs_.push_back(m.s);
+    w_bytes += m.q.size + m.s.size;
+    size_t roff = 0;
+    for (const Tensor* t : ts) {
+      const size_t rows = size_t(t->shape[0]);
+      const uint32_t blks = uint32_t(rows * (K / 32u));
+      run_k(*e, "dflare_quant_q8_bf16",
+            {t->buf, m.q.view(roff * K, rows * K), m.s.view(roff * srow, rows * srow)},
+            DflQuantP{blks, 0u}, (blks + 3u) / 4u, 1u, 128u);
+      roff += rows;
+    }
+    return m;
+  };
   auto to_q8 = [&](const std::string& name) -> Q8Mat {
     const Tensor& t = req(name);
     if (t.shape.size() != 2 || t.dtype != DType::BF16) fatal("ink2_dflare: expected 2D BF16 for %s", name.c_str());
@@ -165,7 +218,7 @@ void Ink2DFlare::load() {
     m.s = g.alloc(ssz, "dfl_q8_s");
     owned_bufs_.push_back(m.q);
     owned_bufs_.push_back(m.s);
-    q8_bytes += qsz + ssz;
+    w_bytes += qsz + ssz;
     const uint16_t* src = t.buf.as<uint16_t>();
     uint8_t* qdst = m.q.as<uint8_t>();
     uint8_t* sdst = m.s.as<uint8_t>();
@@ -211,6 +264,7 @@ void Ink2DFlare::load() {
   mask_embed_ = to_f32_buf("mask_embed", "dfl_mask_embed");
   norm_w_ = to_f32_buf("norm.weight", "dfl_norm_w");
 
+  const uint32_t QD = uint32_t(hq_ * D_), KVD = uint32_t(hkv_ * D_);
   layers_.resize(size_t(NL_));
   for (int l = 0; l < NL_; ++l) {
     const std::string p = "layers." + std::to_string(l) + ".";
@@ -221,15 +275,18 @@ void Ink2DFlare::load() {
     L.q_norm = to_f32_buf(p + "self_attn.q_norm.weight", "dfl_qn");
     L.k_norm = to_f32_buf(p + "self_attn.k_norm.weight", "dfl_kn");
     L.k_norm_ctx = to_f32_buf(p + "self_attn.k_norm_ctx.weight", "dfl_knc");
-    L.q_proj = to_q8(p + "self_attn.q_proj.weight");
-    L.k_proj = to_q8(p + "self_attn.k_proj.weight");
-    L.v_proj = to_q8(p + "self_attn.v_proj.weight");
-    L.o_proj = to_q8(p + "self_attn.o_proj.weight");
+
+    L.qkv_offs[0] = 0u; L.qkv_offs[1] = QD; L.qkv_offs[2] = QD + KVD; L.qkv_offs[3] = QD + 2u * KVD;
+    const std::string qp_n = p + "self_attn.q_proj.weight", kp_n = p + "self_attn.k_proj.weight",
+                      vp_n = p + "self_attn.v_proj.weight", op_n = p + "self_attn.o_proj.weight",
+                      gp_n = p + "mlp.gate_proj.weight", up_n = p + "mlp.up_proj.weight",
+                      dp_n = p + "mlp.down_proj.weight";
+    L.qkv_q = pack_q8({qp_n.c_str(), kp_n.c_str(), vp_n.c_str()});
+    L.o_proj = pack_q8({op_n.c_str()});
     L.k_proj_ctx = to_q8(p + "self_attn.k_proj_ctx.weight");
     L.v_proj_ctx = to_q8(p + "self_attn.v_proj_ctx.weight");
-    L.gate_proj = to_q8(p + "mlp.gate_proj.weight");
-    L.up_proj = to_q8(p + "mlp.up_proj.weight");
-    L.down_proj = to_q8(p + "mlp.down_proj.weight");
+    L.gu_q = pack_q8({gp_n.c_str(), up_n.c_str()});
+    L.down_proj = pack_q8({dp_n.c_str()});
   }
 
   mh_dflare_norm_ = to_f32_buf("markov_head.dflare_norm.weight", "dfl_mh_dn");
@@ -237,35 +294,37 @@ void Ink2DFlare::load() {
   mh_rnn_w_ = copy_bf16_buf("markov_head.rnn_proj.weight", "dfl_mh_rnnw");
   mh_rnn_b_ = to_f32_buf("markov_head.rnn_proj.bias", "dfl_mh_rnnb");
 
-  // Fold target unembed [V, H] @ hidden_out.weight [H, R] -> Q8_0 [V, R] + unembed @ hidden_out.bias -> F32 [V]
+  // Fold target unembed @ hidden_out -> Q8_0 + 2-bit proxy [V, 256] + F32 [V] bias, and pack 2-bit proxy unembed
+  const Tensor& hw = req("markov_head.hidden_out.weight");
+  Buffer hb = to_f32_buf("markov_head.hidden_out.bias", "dfl_mh_hb_tmp", false);
+  const uint32_t V = uint32_t(tg_.vocab()), f_blks = V * uint32_t(rank_ / 32), u_blks = V * uint32_t(H_ / 32);
+  const uint32_t u_f32 = tg_.unembed_tensor().dtype == DType::F32 ? 1u : 0u;
+  fold_q_ = g.alloc(size_t(V) * size_t(rank_), "dfl_fold_q");
+  fold_s_ = g.alloc(size_t(f_blks) * 2u, "dfl_fold_s");
+  fold_p2_q_ = g.alloc(size_t(f_blks) * 8u, "dfl_fold_p2q");
+  fold_p2_s_ = g.alloc(size_t(f_blks) * 2u, "dfl_fold_p2s");
+  fold_b_ = g.alloc(size_t(V) * 4u, "dfl_fold_b");
+  unembed_p2_q_ = g.alloc(size_t(u_blks) * 8u, "dfl_unembed_p2q");
+  unembed_p2_s_ = g.alloc(size_t(u_blks) * 2u, "dfl_unembed_p2s");
+  for (const Buffer& b : {fold_q_, fold_s_, fold_p2_q_, fold_p2_s_, fold_b_, unembed_p2_q_, unembed_p2_s_})
+    owned_bufs_.push_back(b);
+
   {
-    const Tensor& hw = req("markov_head.hidden_out.weight");
-    Buffer hb = to_f32_buf("markov_head.hidden_out.bias", "dfl_mh_hb_tmp");
-    const uint32_t V = uint32_t(tg_.vocab());
-    fold_q_ = g.alloc(size_t(V) * size_t(rank_), "dfl_fold_q");
-    fold_s_ = g.alloc(size_t(V) * size_t(rank_ / 32) * 2, "dfl_fold_s");
-    fold_b_ = g.alloc(size_t(V) * 4, "dfl_fold_b");
-    owned_bufs_.push_back(fold_q_);
-    owned_bufs_.push_back(fold_s_);
-    owned_bufs_.push_back(fold_b_);
-
-    auto e = g.begin();
-    struct { uint32_t V, H, R; } fp{V, uint32_t(H_), uint32_t(rank_)};
-    e->use(dfl_pipe("dflare_fold_mm_q8"));
-    e->buf(0, tg_.unembed_tensor().buf);
-    e->buf(1, hw.buf);
-    e->buf(2, fold_q_);
-    e->buf(3, fold_s_);
-    e->val(4, fp);
-    e->dispatch(uint32_t(rank_ / 32), (V + 31u) / 32u, 1, 128);
+    struct { uint32_t V, H, R, u_f32; } fp{V, uint32_t(H_), uint32_t(rank_), u_f32};
+    run_k(*e, "dflare_fold_mm_q8", {tg_.unembed_tensor().buf, hw.buf, fold_q_, fold_s_, fold_p2_q_, fold_p2_s_},
+          fp, uint32_t(rank_ / 32), (V + 31u) / 32u, 128u);
     tg_.enc_unembed(*e, hb, fold_b_, 1);
-    e->commit_and_wait();
+    run_k(*e, "dflare_quant_p2_w", {tg_.unembed_tensor().buf, unembed_p2_q_, unembed_p2_s_},
+          DflQuantP{u_blks, u_f32}, (u_blks + 3u) / 4u, 1u, 128u);
   }
+  e->commit_and_wait();
+  g.release(hb);
 
-  logi("loaded Inkling-2 DFlare drafter (%d layers Q8, block %d, rank %d, ctx %d): %.2f GB in %.0f ms",
-       NL_, block_size_, rank_, ctx_cap_,
-       (q8_bytes + mh_w1_.size + mh_rnn_w_.size + fold_q_.size + fold_s_.size + fold_b_.size) / 1e9,
-       now_ms() - t0);
+  const size_t head_bytes =
+      mh_w1_.size + mh_rnn_w_.size + fold_q_.size + fold_s_.size + fold_p2_q_.size + fold_p2_s_.size + fold_b_.size +
+      unembed_p2_q_.size + unembed_p2_s_.size;
+  logi("loaded Inkling-2 DFlare drafter (%d layers fused Q8, 2-bit proxy screen, zero-D2H accept): %.2f GB in %.0f ms",
+       NL_, (w_bytes + head_bytes) / 1e9, now_ms() - t0);
 }
 
 void Ink2DFlare::alloc_buffers() {
@@ -290,19 +349,25 @@ void Ink2DFlare::alloc_buffers() {
   bk_ = alloc(B * KVD * 4, "dfl_bk");
   bv_ = alloc(B * KVD * 4, "dfl_bv");
   batt_ = alloc(B * QD * 4, "dfl_batt");
-  bgate_ = alloc(B * size_t(I_) * 4, "dfl_bgate");
-  bup_ = alloc(B * size_t(I_) * 4, "dfl_bup");
   bact_ = alloc(B * size_t(I_) * 4, "dfl_bact");
   draft_h_ = alloc(size_t(kMaxDrafts) * size_t(H_) * 4, "dfl_draft_h");
 
-  const size_t nchunks = (V + 1023) / 1024;
-  base_logits_ = alloc(size_t(kMaxDrafts) * V * 4, "dfl_base_logits");
-  pick_v_ = alloc(nchunks * 4, "dfl_pick_v");
-  pick_i_ = alloc(nchunks * 4, "dfl_pick_i");
+  base_proxy_ = alloc(size_t(kMaxDrafts) * V * 2, "dfl_base_proxy");
+  pick_v_ = alloc(size_t(kShortlistK) * 4, "dfl_pick_v");
+  pick_i_ = alloc(size_t(kShortlistK) * 4, "dfl_pick_i");
 
   mh_state_ = alloc(size_t(rank_) * 4, "dfl_mh_state");
   mh_rnn_in_ = alloc((2 * size_t(rank_) + 2 * size_t(H_)) * 4, "dfl_mh_in");
   mh_latent_ = alloc(size_t(rank_) * 4, "dfl_mh_lat");
+
+  acc_cv_ = alloc(size_t(Inkling2::kMaxVerify) * 4096u * 4u, "dfl_acc_cv");
+  acc_ci_ = alloc(size_t(Inkling2::kMaxVerify) * 4096u * 4u, "dfl_acc_ci");
+  acc_samp_ = alloc(size_t(Inkling2::kMaxVerify) * 4u, "dfl_acc_samp");
+  acc_sprob_ = alloc(16u, "dfl_acc_sprob");
+  acc_dstep_ = alloc(size_t(Inkling2::kMaxVerify) * 4u, "dfl_acc_dstep");
+  for (int i = 0; i < Inkling2::kMaxVerify; ++i) acc_dstep_.as<int>()[i] = i;
+  accept_out_ = alloc(16u, "dfl_accept_out");
+  memset(accept_out_.ptr(), 0, accept_out_.size);
 }
 
 std::unique_ptr<Ink2DFlareSeq> Ink2DFlare::new_seq() {
@@ -343,6 +408,11 @@ void Ink2DFlare::enc_q8(Encoder& e, const Q8Mat& w, const Buffer& x, const Buffe
   e.dispatch((w.N + 3) / 4, (uint32_t(M) + 7) / 8, 1, 128);
 }
 
+void Ink2DFlare::enc_q8_mv(Encoder& e, const Q8Mat& w, const Buffer& x, const Buffer& y, int M, bool add) {
+  run_k(e, "dflare_q8_mv8", {x, w.q, w.s, y}, DflQ8MvP{uint32_t(M), w.N, w.K, w.K / 32u, add ? 1u : 0u},
+        (w.N + 7u) / 8u, 1u, 128u);
+}
+
 void Ink2DFlare::enc_rmsnorm(Encoder& e, const Buffer& x, const Buffer& w, const Buffer& out, int T) {
   const Ink2NormP p{uint32_t(T), uint32_t(H_), 1u, 1u, eps_};
   e.use(dfl_pipe("ink2_rmsnorm"));
@@ -375,8 +445,10 @@ void Ink2DFlare::encode_commit(Encoder& e, Ink2DFlareSeq& ds, const Buffer& taps
         e.val(3, mp);
         e.dispatch(uint32_t(batch), 1, 1, 512);
       }
+      e.group_begin();
       enc_q8(e, L.k_proj_ctx, ctx_h_, ctx_k_, batch, false);
       enc_q8(e, L.v_proj_ctx, ctx_h_, ctx_v_, batch, false);
+      e.group_end();
       {
         const DflCtxKvP kp{uint32_t(batch), uint32_t(hkv_), uint32_t(D_), uint32_t(start_pos + off),
                            uint32_t(ctx_cap_), eps_, theta_};
@@ -408,13 +480,13 @@ void Ink2DFlare::encode_commit(Encoder& e, Ink2DFlareSeq& ds, const Buffer& taps
 void Ink2DFlare::encode_draft(Encoder& e, Seq& s, Ink2DFlareSeq& ds, int pos, int depth) {
   if (depth < 1 || depth > kMaxDrafts) fatal("ink2_dflare: depth %d out of range", depth);
   const int B = depth + 1;
-  const uint32_t V = uint32_t(tg_.vocab());
+  const uint32_t H = uint32_t(H_), R = uint32_t(rank_), V = uint32_t(tg_.vocab());
   const float scale = 1.0f / std::sqrt(float(D_));
   const uint32_t ctx_len = uint32_t(std::min(ds.ctx_len, std::min(pos, ctx_cap_)));
 
   // 1. Build block [anchor_embed, mask_embed x depth] -> bx_
   {
-    const DflBlockP bp{uint32_t(B), uint32_t(H_), uint32_t(pos), uint32_t(tg_.embed_tensor().shape[0]), eps_};
+    const DflBlockP bp{uint32_t(B), H, uint32_t(pos), uint32_t(tg_.embed_tensor().shape[0]), eps_};
     e.use(dfl_pipe("dflare_build_block"));
     e.buf(0, s.tok);
     e.buf(1, tg_.embed_tensor().buf);
@@ -425,105 +497,79 @@ void Ink2DFlare::encode_draft(Encoder& e, Seq& s, Ink2DFlareSeq& ds, int pos, in
     e.dispatch(uint32_t(B), 1, 1, 512);
   }
 
-  // 2. 3 draft transformer layers
+  // 2. 3 draft transformer layers (Q8_0 fused QKV + SwiGLU)
   for (int l = 0; l < NL_; ++l) {
     const Layer& L = layers_[size_t(l)];
     enc_rmsnorm(e, bx_, L.input_norm, bn_, B);
-    enc_q8(e, L.q_proj, bn_, bq_, B, false);
-    enc_q8(e, L.k_proj, bn_, bk_, B, false);
-    enc_q8(e, L.v_proj, bn_, bv_, B, false);
     {
-      const DflQkRopeP rp{uint32_t(B), uint32_t(hq_), uint32_t(hkv_), uint32_t(D_), uint32_t(pos), eps_, theta_};
-      e.use(dfl_pipe("dflare_qk_rope"));
-      e.buf(0, bq_);
-      e.buf(1, bk_);
-      e.buf(2, L.q_norm);
-      e.buf(3, L.k_norm);
-      e.val(4, rp);
-      e.dispatch(uint32_t(hq_ + hkv_), uint32_t(B), 1, uint32_t(D_));
+      const DflQ8Multi3P mp{uint32_t(B), H, L.qkv_offs[3], H / 32u,
+                            {L.qkv_offs[0], L.qkv_offs[1], L.qkv_offs[2], L.qkv_offs[3]}};
+      run_k(e, "dflare_q8_mv8_multi3", {bn_, L.qkv_q.q, L.qkv_q.s, bq_, bk_, bv_}, mp, (mp.N_tot + 7u) / 8u, 1u, 128u);
     }
-    {
-      const DflAttnP ap{uint32_t(B), uint32_t(hq_), uint32_t(hkv_), uint32_t(D_),
-                        uint32_t(pos), ctx_len, uint32_t(ctx_cap_), scale};
-      e.use(dfl_pipe("dflare_attn"));
-      e.buf(0, bq_);
-      e.buf(1, ds.kc[size_t(l)]);
-      e.buf(2, ds.vc[size_t(l)]);
-      e.buf(3, bk_);
-      e.buf(4, bv_);
-      e.buf(5, batt_);
-      e.val(6, ap);
-      e.dispatch(uint32_t(hq_), uint32_t(B), 1, 128);
-    }
-    enc_q8(e, L.o_proj, batt_, bx_, B, true);
+    run_k(e, "dflare_qk_rope", {bq_, bk_, L.q_norm, L.k_norm},
+          DflQkRopeP{uint32_t(B), uint32_t(hq_), uint32_t(hkv_), uint32_t(D_), uint32_t(pos), eps_, theta_},
+          uint32_t(hq_ + hkv_), uint32_t(B), uint32_t(D_));
+    run_k(e, "dflare_attn", {bq_, ds.kc[size_t(l)], ds.vc[size_t(l)], bk_, bv_, batt_},
+          DflAttnP{uint32_t(B), uint32_t(hq_), uint32_t(hkv_), uint32_t(D_), uint32_t(pos), ctx_len, uint32_t(ctx_cap_), scale},
+          uint32_t(hq_), uint32_t(B), 128u);
+    enc_q8_mv(e, L.o_proj, batt_, bx_, B, true);
 
     enc_rmsnorm(e, bx_, L.post_norm, bn_, B);
-    enc_q8(e, L.gate_proj, bn_, bgate_, B, false);
-    enc_q8(e, L.up_proj, bn_, bup_, B, false);
-    {
-      const DflSwigluP sp{uint32_t(B) * uint32_t(I_)};
-      e.use(dfl_pipe("dflare_swiglu"));
-      e.buf(0, bgate_);
-      e.buf(1, bup_);
-      e.buf(2, bact_);
-      e.val(3, sp);
-      e.dispatch((sp.n + 255) / 256, 1, 1, 256);
-    }
-    enc_q8(e, L.down_proj, bact_, bx_, B, true);
+    run_k(e, "dflare_q8_gate_up_swiglu8", {bn_, L.gu_q.q, L.gu_q.s, bact_},
+          DflQ8MvP{uint32_t(B), uint32_t(I_), H, H / 32u, 0u}, (uint32_t(I_) + 3u) / 4u, 1u, 128u);
+    enc_q8_mv(e, L.down_proj, bact_, bx_, B, true);
   }
 
   // 3. Final norm on mask positions [1 .. depth] -> draft_h_ [depth, H]
-  enc_rmsnorm(e, bx_.view(size_t(H_) * 4, size_t(depth) * size_t(H_) * 4), norm_w_, draft_h_, depth);
+  enc_rmsnorm(e, bx_.view(size_t(H) * 4, size_t(depth) * size_t(H) * 4), norm_w_, draft_h_, depth);
 
-  // 4. Base logits via target unembed [depth, V] (raw, pre-softcap)
-  tg_.enc_unembed(e, draft_h_, base_logits_, depth);
+  // 4. 2-bit proxy unembed base screening [depth, V] fp16
+  run_k(e, "dflare_p2_unembed_base", {draft_h_, unembed_p2_q_, unembed_p2_s_, fold_b_, base_proxy_},
+        DflP2BaseP{uint32_t(depth), V, H, H / 32u}, (V + 15u) / 16u, 1u, 128u);
 
-  // 5. Left-to-right RNN Markov head (step 0..depth-1) with folded Q8_0 [V, 256] full-vocab rescore
-  const float softcap = tg_.config().logit_softcap;
-  const float inv_sc = softcap > 0.0f ? (1.0f / softcap) : 0.0f;
-  const uint32_t rnn_in_dim = uint32_t(2 * rank_ + 2 * H_);
-  const uint32_t nchunks = (V + 1023u) / 1024u;
+  // 5. Left-to-right RNN Markov head: 2-bit full-vocab screen -> exact top-128 rescore -> argmax
+  const uint32_t rnn_in_dim = 2u * R + 2u * H, has_sup = s.suppression ? 1u : 0u;
+  const uint32_t sup_words = has_sup ? uint32_t(s.suppression->words) : 0u;
+  const Buffer& sup_buf = has_sup ? s.suppression->mask : fold_b_;
+  const uint32_t u_f32 = tg_.unembed_tensor().dtype == DType::F32 ? 1u : 0u;
   for (int step = 0; step < depth; ++step) {
-    const DflMarkovP mp{uint32_t(rank_), uint32_t(H_), uint32_t(kCandK), uint32_t(step),
-                        uint32_t(pos + step), uint32_t(pos + step + 1), softcap, inv_sc};
-    e.use(dfl_pipe("dflare_markov_concat"));
-    e.buf(0, mh_state_);
-    e.buf(1, mh_w1_);
-    e.buf(2, draft_h_);
-    e.buf(3, ds.rows_f);
-    e.buf(4, s.tok);
-    e.buf(5, mh_rnn_in_);
-    e.val(6, mp);
-    e.dispatch((rnn_in_dim + 255) / 256, 1, 1, 256);
-
-    e.use(dfl_pipe("dflare_markov_gru"));
-    e.buf(0, mh_rnn_in_);
-    e.buf(1, mh_rnn_w_);
-    e.buf(2, mh_rnn_b_);
-    e.buf(3, mh_state_);
-    e.buf(4, mh_latent_);
-    e.val(5, mp);
-    e.dispatch((uint32_t(rank_) + 3) / 4, 1, 1, 128);
-
-    struct { uint32_t V, R, step, tok_out_idx; } fp{V, uint32_t(rank_), uint32_t(step), uint32_t(pos + step + 1)};
-    e.use(dfl_pipe("dflare_fold_pick_s1"));
-    e.buf(0, mh_latent_);
-    e.buf(1, fold_q_);
-    e.buf(2, fold_s_);
-    e.buf(3, fold_b_);
-    e.buf(4, base_logits_);
-    e.buf(5, pick_v_);
-    e.buf(6, pick_i_);
-    e.val(7, fp);
-    e.dispatch(nchunks, 1, 1, 128);
-
-    e.use(dfl_pipe("dflare_fold_pick_s2"));
-    e.buf(0, pick_v_);
-    e.buf(1, pick_i_);
-    e.buf(2, s.tok);
-    e.val(3, fp);
-    e.dispatch(1, 1, 1, 256);
+    const DflMarkovP mp{R, H, uint32_t(kCandK), uint32_t(step), uint32_t(pos + step), uint32_t(pos + step + 1), 0.0f, 0.0f};
+    run_k(e, "dflare_markov_concat", {mh_state_, mh_w1_, draft_h_, ds.rows_f, s.tok, mh_rnn_in_}, mp,
+          (rnn_in_dim + 255u) / 256u, 1u, 256u);
+    run_k(e, "dflare_markov_gru", {mh_rnn_in_, mh_rnn_w_, mh_rnn_b_, mh_state_, mh_latent_}, mp, (R + 3u) / 4u, 1u, 128u);
+    run_k(e, "dflare_p2_fold_screen",
+          {mh_latent_, fold_p2_q_, fold_p2_s_, base_proxy_.view(size_t(step) * V * 2u, size_t(V) * 2u), sup_buf, pick_v_, pick_i_},
+          DflP2ScreenP{V, R, has_sup, sup_words}, 64u, 1u, 256u);
+    run_k(e, "dflare_rescore_exact",
+          {draft_h_.view(size_t(step) * H * 4u, size_t(H) * 4u), mh_latent_, tg_.unembed_tensor().buf, fold_q_, fold_s_,
+           fold_b_, sup_buf, pick_i_, pick_v_},
+          DflRescoreP{V, H, R, u_f32, has_sup, sup_words}, 32u, 1u, 128u);
+    run_k(e, "dflare_argmax_128", {pick_v_, pick_i_, s.tok}, DflArgmaxP{uint32_t(pos + step + 1)}, 1u, 1u, 128u);
   }
+}
+
+void Ink2DFlare::encode_accept(Encoder& e, Seq& s, int pos, int depth, const Buffer& verify_logits,
+                               const SamplingParams& sp) {
+  const uint32_t V = uint32_t(tg_.vocab());
+  const int R = depth + 1;
+  if (full_vocab(sp)) {
+    enc_sample_full_rows(e, verify_logits, V, R, acc_samp_, 0, acc_sprob_, sp, uint32_t(pos), acc_dstep_, 0);
+  } else {
+    static const Pipeline p_tk = Gpu::get().pipeline("topk_stage1_rows_sg");
+    static const Pipeline p_s2 = Gpu::get().pipeline("sample_stage2_rows");
+    const uint32_t K = topk_k(sp), chunk = topk_chunk(K), lists = topk_lists(V, K);
+    e.use(p_tk);
+    e.buf(0, verify_logits); e.buf(1, acc_cv_); e.buf(2, acc_ci_);
+    e.val(3, kp::TopkStage{V, K, chunk});
+    e.dispatch(lists, uint32_t(R), 1, topk_threads(K));
+
+    e.use(p_s2);
+    e.buf(0, acc_cv_); e.buf(1, acc_ci_); e.buf(2, acc_samp_);
+    e.val(3, kp::SampleRows{lists * K, K, sp.temperature, sp.top_p, sp.seed, uint32_t(pos), 0u, 0u, 0u, 0u});
+    e.buf(4, acc_dstep_);  // unused when table_from == 0
+    e.dispatch(uint32_t(R), 1, 1, 1024);
+  }
+  run_k(e, "dflare_accept_samples", {s.tok, acc_samp_, accept_out_}, DflAccP{uint32_t(pos), uint32_t(depth)}, 1u, 1u, 32u);
 }
 
 }  // namespace ni

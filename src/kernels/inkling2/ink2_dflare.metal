@@ -41,44 +41,35 @@ struct DflQ8P {
   uint M, N, K, add;
 };
 
-NI_INLINE float dfl_q8_dot16(uint4 v, const device float4* xp) {
-  float d = 0.0f;
-  for (uint m = 0; m < 4; ++m) {
-    const uint w = v[m];
-    const float4 xv = xp[m];
-    d += float(as_type<char>(uchar(w & 0xFFu))) * xv.x +
-         float(as_type<char>(uchar((w >> 8) & 0xFFu))) * xv.y +
-         float(as_type<char>(uchar((w >> 16) & 0xFFu))) * xv.z +
-         float(as_type<char>(uchar((w >> 24) & 0xFFu))) * xv.w;
-  }
-  return d;
-}
-
-// Q8_0 matmul for draft layers (2D grid: tg.x = n/4, tg.y = m/8, supports any M >= 1)
+// Coalesced Q8_0 matmul for draft context projections (M <= 64, 2D grid: tg.x = n/4, tg.y = m/8).
 [[kernel]] void dflare_q8_mm(const device float* x [[buffer(0)]], const device uchar* q [[buffer(1)]],
                              const device half* s [[buffer(2)]], device float* y [[buffer(3)]],
                              constant DflQ8P& p [[buffer(4)]], uint2 tg [[threadgroup_position_in_grid]],
                              uint sg [[simdgroup_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]]) {
-  const uint n = tg.x * 4 + sg;
+  const uint n = tg.x * 4u + sg;
   if (n >= p.N) return;
-  const uint m0 = tg.y * 8;
+  const uint m0 = tg.y * 8u;
   const uint mc = min(8u, p.M - m0);
-  const uint blocks = p.K / 32;
+  const uint blocks = p.K / 32u;
   const size_t qoff = size_t(n) * p.K;
   const size_t soff = size_t(n) * blocks;
+  const uint kl = lane * 8u, blk_loc = lane >> 2u;
   float acc[8] = {0, 0, 0, 0, 0, 0, 0, 0};
-  for (uint blk = lane; blk < blocks; blk += 32) {
-    const float sc = float(s[soff + blk]);
-    const device uint4* qp = (const device uint4*)(q + qoff + blk * 32);
-    const uint4 v0 = qp[0], v1 = qp[1];
-    for (uint m = 0; m < mc; ++m) {
-      const device float4* xp = (const device float4*)(x + size_t(m0 + m) * p.K + blk * 32);
-      acc[m] += (dfl_q8_dot16(v0, xp) + dfl_q8_dot16(v1, xp + 4)) * sc;
+  for (uint kbase = 0u; kbase < p.K; kbase += 256u) {
+    if (kl < p.K - kbase) {
+      const uint blk = (kbase >> 5u) + blk_loc;
+      const uint2 qw = *(const device uint2*)(q + qoff + kbase + kl);
+      const float sc = float(s[soff + blk]);
+      const float4 wa = float4(as_type<char4>(qw.x)) * sc, wb = float4(as_type<char4>(qw.y)) * sc;
+      for (uint m = 0u; m < mc; ++m) {
+        const device float* xp = x + size_t(m0 + m) * p.K + kbase + kl;
+        acc[m] += dot(*(const device float4*)(xp), wa) + dot(*(const device float4*)(xp + 4u), wb);
+      }
     }
   }
-  for (uint m = 0; m < mc; ++m) {
+  for (uint m = 0u; m < mc; ++m) {
     const float sum = simd_sum(acc[m]);
-    if (lane == 0) {
+    if (lane == 0u) {
       device float* dst = y + size_t(m0 + m) * p.N + n;
       *dst = p.add ? (*dst + sum) : sum;
     }
@@ -273,19 +264,7 @@ struct DflAttnP {
   }
 }
 
-struct DflSwigluP {
-  uint n;
-};
-
-[[kernel]] void dflare_swiglu(const device float* gate [[buffer(0)]], const device float* up [[buffer(1)]],
-                              device float* out [[buffer(2)]], constant DflSwigluP& p [[buffer(3)]],
-                              uint i [[thread_position_in_grid]]) {
-  if (i >= p.n) return;
-  const float g = gate[i];
-  out[i] = (g / (1.0f + metal::precise::exp(-g))) * up[i];
-}
-
-// ---- RNN Markov Head (rank R=256, folded Q8_0 [V, 256] full-vocab rescoring) ----
+// ---- RNN Markov Head (rank R=256, 2-bit proxy screening + top-128 exact rescoring) ----
 struct DflMarkovP {
   uint R, H, K, step, tok_prev_idx, tok_out_idx;
   float softcap, inv_softcap;
@@ -350,14 +329,22 @@ struct DflMarkovP {
   }
 }
 
-// One-time load kernel: fold unembed [V, H] BF16 @ hidden_out.weight [H, 256] BF16 -> Q8_0 [V, 256]
+NI_INLINE void dfl_p2_pack(float val, uint lane, thread uint2& q_out, thread float& alpha_out) {
+  alpha_out = (simd_sum(fabs(val)) * (1.0f / 32.0f)) * 1.25f;
+  const uint c = (val >= alpha_out) ? 3u : ((val >= 0.0f) ? 2u : ((val >= -alpha_out) ? 1u : 0u));
+  const uint sh = 2u * (lane & 15u);
+  q_out = uint2(simd_sum((lane < 16u ? c : 0u) << sh), simd_sum((lane >= 16u ? c : 0u) << sh));
+}
+
+// One-time load kernel: fold unembed [V, H] @ hidden_out.weight [H, 256] -> Q8_0 + 2-bit proxy [V, 256]
 struct DflFoldP {
-  uint V, H, R;
+  uint V, H, R, u_f32;
 };
 
-[[kernel]] void dflare_fold_mm_q8(const device bfloat* unembed [[buffer(0)]], const device bfloat* hout_w [[buffer(1)]],
+[[kernel]] void dflare_fold_mm_q8(const device void* unembed [[buffer(0)]], const device bfloat* hout_w [[buffer(1)]],
                                   device uchar* fold_q [[buffer(2)]], device half* fold_s [[buffer(3)]],
-                                  constant DflFoldP& p [[buffer(4)]], uint2 tg [[threadgroup_position_in_grid]],
+                                  device uint2* fold_p2_q [[buffer(4)]], device half* fold_p2_s [[buffer(5)]],
+                                  constant DflFoldP& p [[buffer(6)]], uint2 tg [[threadgroup_position_in_grid]],
                                   uint tid [[thread_index_in_threadgroup]], uint sg [[simdgroup_index_in_threadgroup]],
                                   uint lane [[thread_index_in_simdgroup]]) {
   threadgroup float xs[32][36];
@@ -376,7 +363,12 @@ struct DflFoldP {
     for (uint idx = tid; idx < 1024u; idx += 128u) {
       const uint r = idx >> 5, c = idx & 31u;
       const uint v = v0 + r;
-      xs[r][c] = (v < p.V && k0 + c < p.H) ? float(unembed[size_t(v) * p.H + (k0 + c)]) : 0.0f;
+      float uv = 0.0f;
+      if (v < p.V && k0 + c < p.H) {
+        const size_t uidx = size_t(v) * p.H + (k0 + c);
+        uv = p.u_f32 ? ((const device float*)unembed)[uidx] : float(((const device bfloat*)unembed)[uidx]);
+      }
+      xs[r][c] = uv;
       ws[r][c] = (k0 + r < p.H && r0 + c < p.R) ? float(hout_w[size_t(k0 + r) * p.R + (r0 + c)]) : 0.0f;
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -403,108 +395,349 @@ struct DflFoldP {
     const float d = amax / 127.0f;
     const float id = d > 0.0f ? (1.0f / d) : 0.0f;
     fold_q[size_t(v) * p.R + r0 + lane] = uchar(char(clamp(int(rint(val * id)), -127, 127)));
-    if (lane == 0) fold_s[size_t(v) * nblk + blk] = half(d);
+    uint2 p2q; float alpha;
+    dfl_p2_pack(val, lane, p2q, alpha);
+    if (lane == 0u) {
+      fold_s[size_t(v) * nblk + blk] = half(d);
+      fold_p2_q[size_t(v) * nblk + blk] = p2q;
+      fold_p2_s[size_t(v) * nblk + blk] = half(alpha);
+    }
   }
 }
 
-struct DflFoldPickP {
-  uint V, R, step, tok_out_idx;
-};
+NI_INLINE float4 dfl_bf16_4(uint2 r) {
+  return float4(as_type<float>(r.x << 16), as_type<float>(r.x & 0xFFFF0000u),
+                as_type<float>(r.y << 16), as_type<float>(r.y & 0xFFFF0000u));
+}
 
-// Fused full-vocab Markov rescore + stage-1 argmax:
-// score(v) = base_logits[step, v] + fold_b[v] + dot(latent[0..255], fold_q8[v, 0..255])
-// Launched with ceil(V / 1024) threadgroups of 128 threads (16 groups of 8 lanes; 1 lane = 1 Q8 block of 32).
-[[kernel]] void dflare_fold_pick_s1(const device float* latent [[buffer(0)]], const device uchar* fold_q [[buffer(1)]],
-                                    const device half* fold_s [[buffer(2)]], const device float* fold_b [[buffer(3)]],
-                                    const device float* base_logits [[buffer(4)]], device float* out_v [[buffer(5)]],
-                                    device uint* out_i [[buffer(6)]], constant DflFoldPickP& p [[buffer(7)]],
-                                    uint tg [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]],
-                                    uint sg [[simdgroup_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]]) {
-  threadgroup float lat[256];
-  threadgroup float sv[16];
-  threadgroup uint si[16];
-  for (uint i = tid; i < 256u; i += 128u) lat[i] = latent[i];
-  threadgroup_barrier(mem_flags::mem_threadgroup);
-
-  const uint grp = tid >> 3;   // 0..15 (which of the 16 concurrent vocab rows)
-  const uint blk = lane & 7u;  // 0..7  (which 32-elem Q8 block of R=256)
-  const uint v_start = tg * 1024u;
-  const uint v_end = min(p.V, v_start + 1024u);
-  const device float* br = base_logits + size_t(p.step) * p.V;
-
-  // Load this lane's 32 floats of latent into registers (reused across all 64 vocab rows!)
-  float4 lx[8];
-  for (uint j = 0; j < 8u; ++j) lx[j] = *(const threadgroup float4*)(&lat[blk * 32u + j * 4u]);
-
-  float best_v = -INFINITY;
-  uint best_i = 0u;
-  for (uint v = v_start + grp; v < v_end; v += 16u) {
-    const float sc = float(fold_s[size_t(v) * 8u + blk]);
-    const device uint4* qp = (const device uint4*)(fold_q + size_t(v) * 256u + blk * 32u);
-    const uint4 q0 = qp[0], q1 = qp[1];
-    float d = 0.0f;
-    for (uint m = 0; m < 4u; ++m) {
-      const uint w = q0[m];
-      const float4 xv = lx[m];
-      d += float(as_type<char>(uchar(w & 0xFFu))) * xv.x +
-           float(as_type<char>(uchar((w >> 8) & 0xFFu))) * xv.y +
-           float(as_type<char>(uchar((w >> 16) & 0xFFu))) * xv.z +
-           float(as_type<char>(uchar((w >> 24) & 0xFFu))) * xv.w;
-    }
-    for (uint m = 0; m < 4u; ++m) {
-      const uint w = q1[m];
-      const float4 xv = lx[m + 4u];
-      d += float(as_type<char>(uchar(w & 0xFFu))) * xv.x +
-           float(as_type<char>(uchar((w >> 8) & 0xFFu))) * xv.y +
-           float(as_type<char>(uchar((w >> 16) & 0xFFu))) * xv.z +
-           float(as_type<char>(uchar((w >> 24) & 0xFFu))) * xv.w;
-    }
-    float s = d * sc;
-    s += simd_shuffle_xor(s, 1);
-    s += simd_shuffle_xor(s, 2);
-    s += simd_shuffle_xor(s, 4);
-    if (blk == 0u) {
-      const float score = br[v] + fold_b[v] + s;
-      if (score > best_v) {
-        best_v = score;
-        best_i = v;
-      }
-    }
-  }
-  if (blk == 0u) {
-    sv[grp] = best_v;
-    si[grp] = best_i;
-  }
-  threadgroup_barrier(mem_flags::mem_threadgroup);
-  if (tid == 0u) {
-    float mv = -INFINITY;
-    uint mi = 0u;
-    for (uint g = 0; g < 16u; ++g) {
-      if (sv[g] > mv) {
-        mv = sv[g];
-        mi = si[g];
-      }
-    }
-    out_v[tg] = mv;
-    out_i[tg] = mi;
+NI_INLINE void dfl_p2_unpack(uint2 q, thread float4 c[8]) {
+  _Pragma("clang loop unroll(full)")
+  for (uint i = 0u; i < 4u; ++i) {
+    const uint bx = q.x >> (i * 8u), by = q.y >> (i * 8u);
+    c[i] = float4(float(bx & 3u), float((bx >> 2u) & 3u), float((bx >> 4u) & 3u), float((bx >> 6u) & 3u));
+    c[i + 4u] = float4(float(by & 3u), float((by >> 2u) & 3u), float((by >> 4u) & 3u), float((by >> 6u) & 3u));
   }
 }
 
-[[kernel]] void dflare_fold_pick_s2(const device float* in_v [[buffer(0)]], const device uint* in_i [[buffer(1)]],
-                                    device int* tokens [[buffer(2)]], constant DflFoldPickP& p [[buffer(3)]],
-                                    uint tid [[thread_index_in_threadgroup]]) {
-  threadgroup float sv[256];
-  threadgroup uint si[256];
-  const uint n = (p.V + 1023u) / 1024u;
-  sv[tid] = tid < n ? in_v[tid] : -INFINITY;
-  si[tid] = tid < n ? in_i[tid] : 0u;
-  threadgroup_barrier(mem_flags::mem_threadgroup);
-  for (uint s = 128u; s > 0u; s >>= 1) {
-    if (tid < s && sv[tid + s] > sv[tid]) {
-      sv[tid] = sv[tid + s];
-      si[tid] = si[tid + s];
+NI_INLINE float dfl_p2_dot32(const thread float4 c[8], const threadgroup float4* xmp, float blk_sum, float sc) {
+  float s = 0.0f;
+  _Pragma("clang loop unroll(full)")
+  for (uint i = 0u; i < 8u; ++i) s += dot(xmp[i], c[i]);
+  return (s - 1.5f * blk_sum) * sc;
+}
+
+NI_INLINE bool dfl_tok_allowed(const device uint* sup_mask, uint v, uint has_sup, uint sup_words) {
+  return !has_sup || (v >> 5u) >= sup_words || (((sup_mask[v >> 5u] >> (v & 31u)) & 1u) != 0u);
+}
+
+NI_INLINE void dfl_top2(float v, uint i, thread float& m0v, thread uint& m0i, thread float& m1v, thread uint& m1i) {
+  if (v > m0v || (v == m0v && i < m0i)) { m1v = m0v; m1i = m0i; m0v = v; m0i = i; }
+  else if (v > m1v || (v == m1v && i < m1i)) { m1v = v; m1i = i; }
+}
+
+// ---- GPU Load-Time Quantizers (Q8_0 and 2-bit proxy) ----
+struct DflQuantP { uint total_blocks, w_f32; };
+
+[[kernel]] void dflare_quant_q8_bf16(const device bfloat* w [[buffer(0)]], device uchar* q [[buffer(1)]],
+                                     device half* s [[buffer(2)]], constant DflQuantP& p [[buffer(3)]],
+                                     uint tg [[threadgroup_position_in_grid]], uint sg [[simdgroup_index_in_threadgroup]],
+                                     uint lane [[thread_index_in_simdgroup]]) {
+  const uint blk = tg * 4u + sg;
+  if (blk >= p.total_blocks) return;
+  const uint idx = blk * 32u + lane;
+  const float v = float(w[idx]), d = simd_max(fabs(v)) * (1.0f / 127.0f), id = d > 0.0f ? (1.0f / d) : 0.0f;
+  q[idx] = uchar(char(clamp(int(rint(v * id)), -127, 127)));
+  if (lane == 0u) s[blk] = half(d);
+}
+
+[[kernel]] void dflare_quant_p2_w(const device void* w [[buffer(0)]], device uint2* q [[buffer(1)]],
+                                  device half* s [[buffer(2)]], constant DflQuantP& p [[buffer(3)]],
+                                  uint tg [[threadgroup_position_in_grid]], uint sg [[simdgroup_index_in_threadgroup]],
+                                  uint lane [[thread_index_in_simdgroup]]) {
+  const uint blk = tg * 4u + sg;
+  if (blk >= p.total_blocks) return;
+  const uint idx = blk * 32u + lane;
+  const float v = p.w_f32 ? ((const device float*)w)[idx] : float(((const device bfloat*)w)[idx]);
+  uint2 p2q; float alpha;
+  dfl_p2_pack(v, lane, p2q, alpha);
+  if (lane == 0u) { q[blk] = p2q; s[blk] = half(alpha); }
+}
+
+// ---- Fused Q8_0 Draft Backbone Kernels (M <= 8) ----
+struct DflQ8MvP { uint M, N, K, nblk, add; };
+struct DflQ8Multi3P { uint M, K, N_tot, nblk; uint offs[4]; };
+
+template <bool MULTI3, uint M_MAX>
+NI_INLINE void dfl_q8_mv_impl(const device float* x, const device uchar* wq, const device half* ws,
+                              device float* y0, device float* y1, device float* y2, const uint offs[4],
+                              uint M, uint N_tot, uint K, uint nblk, uint add, uint tg, uint sg, uint lane) {
+  const uint n0 = (tg * 4u + sg) * 2u;
+  if (n0 >= N_tot) return;
+  uint seg = 0u;
+  if (MULTI3) while (seg < 2u && n0 >= offs[seg + 1u]) ++seg;
+  const uint seg_off = MULTI3 ? offs[seg] : 0u, seg_end = MULTI3 ? offs[seg + 1u] : N_tot, seg_len = seg_end - seg_off;
+  if (n0 >= seg_end) return;
+  const bool has1 = (n0 + 1u) < seg_end;
+  const size_t woff0 = size_t(n0) * K, woff1 = has1 ? (woff0 + K) : woff0;
+  const size_t soff0 = size_t(n0) * nblk, soff1 = has1 ? (soff0 + nblk) : soff0;
+  const uint kl = lane * 8u, blk_loc = lane >> 2u;
+  float acc0[M_MAX] = {}, acc1[M_MAX] = {};
+  for (uint kbase = 0u; kbase < K; kbase += 256u) {
+    if (kl < K - kbase) {
+      const uint blk = (kbase >> 5u) + blk_loc;
+      const uint2 qw0 = *(const device uint2*)(wq + woff0 + kbase + kl), qw1 = has1 ? *(const device uint2*)(wq + woff1 + kbase + kl) : qw0;
+      const float sc0 = float(ws[soff0 + blk]), sc1 = has1 ? float(ws[soff1 + blk]) : sc0;
+      const float4 w0a = float4(as_type<char4>(qw0.x)) * sc0, w0b = float4(as_type<char4>(qw0.y)) * sc0;
+      const float4 w1a = float4(as_type<char4>(qw1.x)) * sc1, w1b = float4(as_type<char4>(qw1.y)) * sc1;
+      _Pragma("clang loop unroll(full)")
+      for (uint m = 0u; m < M_MAX; ++m) if (m < M) {
+        const device float* xp = x + size_t(m) * K + kbase + kl;
+        const float4 x0 = *(const device float4*)(xp + 0u), x1 = *(const device float4*)(xp + 4u);
+        acc0[m] += dot(x0, w0a) + dot(x1, w0b);
+        if (has1) acc1[m] += dot(x0, w1a) + dot(x1, w1b);
+      }
+    }
+  }
+  device float* bases[3] = {y0, y1, y2};
+  device float* dst_base = (MULTI3 ? bases[seg] : y0) + (n0 - seg_off);
+  _Pragma("clang loop unroll(full)")
+  for (uint m = 0u; m < M_MAX; ++m) {
+    if (m >= M) break;
+    const float s0 = simd_sum(acc0[m]), s1 = has1 ? simd_sum(acc1[m]) : 0.0f;
+    if (lane == 0u) {
+      device float* dst = dst_base + size_t(m) * seg_len;
+      dst[0] = (!MULTI3 && add) ? (dst[0] + s0) : s0;
+      if (has1) dst[1] = (!MULTI3 && add) ? (dst[1] + s1) : s1;
+    }
+  }
+}
+
+[[kernel]] void dflare_q8_mv8(const device float* x [[buffer(0)]], const device uchar* wq [[buffer(1)]],
+                              const device half* ws [[buffer(2)]], device float* y [[buffer(3)]],
+                              constant DflQ8MvP& p [[buffer(4)]], uint tg [[threadgroup_position_in_grid]],
+                              uint sg [[simdgroup_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]]) {
+  const uint dummy[4] = {0u, p.N, p.N, p.N};
+  if (p.M <= 4u) dfl_q8_mv_impl<false, 4u>(x, wq, ws, y, y, y, dummy, p.M, p.N, p.K, p.nblk, p.add, tg, sg, lane);
+  else dfl_q8_mv_impl<false, 8u>(x, wq, ws, y, y, y, dummy, p.M, p.N, p.K, p.nblk, p.add, tg, sg, lane);
+}
+
+[[kernel]] void dflare_q8_mv8_multi3(const device float* x [[buffer(0)]], const device uchar* wq [[buffer(1)]],
+                                     const device half* ws [[buffer(2)]], device float* y0 [[buffer(3)]],
+                                     device float* y1 [[buffer(4)]], device float* y2 [[buffer(5)]],
+                                     constant DflQ8Multi3P& p [[buffer(6)]], uint tg [[threadgroup_position_in_grid]],
+                                     uint sg [[simdgroup_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]]) {
+  const uint offs[4] = {p.offs[0], p.offs[1], p.offs[2], p.offs[3]};
+  if (p.M <= 4u) dfl_q8_mv_impl<true, 4u>(x, wq, ws, y0, y1, y2, offs, p.M, p.N_tot, p.K, p.nblk, 0u, tg, sg, lane);
+  else dfl_q8_mv_impl<true, 8u>(x, wq, ws, y0, y1, y2, offs, p.M, p.N_tot, p.K, p.nblk, 0u, tg, sg, lane);
+}
+
+template <uint M_MAX>
+NI_INLINE void dfl_q8_gu_impl(const device float* x, const device uchar* wq, const device half* ws,
+                              device float* out, constant DflQ8MvP& p, uint tg, uint sg, uint lane) {
+  const uint j = tg * 4u + sg;
+  if (j >= p.N) return;
+  float ag[M_MAX] = {}, au[M_MAX] = {};
+  const size_t woff_g = size_t(j) * p.K, woff_u = size_t(j + p.N) * p.K;
+  const size_t soff_g = size_t(j) * p.nblk, soff_u = size_t(j + p.N) * p.nblk;
+  const uint kl = lane * 8u, blk_loc = lane >> 2u;
+  for (uint kbase = 0u; kbase < p.K; kbase += 256u) {
+    if (kl < p.K - kbase) {
+      const uint blk = (kbase >> 5u) + blk_loc;
+      const uint2 qwg = *(const device uint2*)(wq + woff_g + kbase + kl), qwu = *(const device uint2*)(wq + woff_u + kbase + kl);
+      const float scg = float(ws[soff_g + blk]), scu = float(ws[soff_u + blk]);
+      const float4 wga = float4(as_type<char4>(qwg.x)) * scg, wgb = float4(as_type<char4>(qwg.y)) * scg;
+      const float4 wua = float4(as_type<char4>(qwu.x)) * scu, wub = float4(as_type<char4>(qwu.y)) * scu;
+      _Pragma("clang loop unroll(full)")
+      for (uint m = 0u; m < M_MAX; ++m) if (m < p.M) {
+        const device float* xp = x + size_t(m) * p.K + kbase + kl;
+        const float4 x0 = *(const device float4*)(xp + 0u), x1 = *(const device float4*)(xp + 4u);
+        ag[m] += dot(x0, wga) + dot(x1, wgb);
+        au[m] += dot(x0, wua) + dot(x1, wub);
+      }
+    }
+  }
+  _Pragma("clang loop unroll(full)")
+  for (uint m = 0u; m < M_MAX; ++m) {
+    if (m >= p.M) break;
+    const float g = simd_sum(ag[m]), u = simd_sum(au[m]);
+    if (lane == 0u) out[size_t(m) * p.N + j] = (g / (1.0f + metal::precise::exp(-g))) * u;
+  }
+}
+
+[[kernel]] void dflare_q8_gate_up_swiglu8(const device float* x [[buffer(0)]], const device uchar* wq [[buffer(1)]],
+                                          const device half* ws [[buffer(2)]], device float* out [[buffer(3)]],
+                                          constant DflQ8MvP& p [[buffer(4)]], uint tg [[threadgroup_position_in_grid]],
+                                          uint sg [[simdgroup_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]]) {
+  if (p.M <= 4u) dfl_q8_gu_impl<4u>(x, wq, ws, out, p, tg, sg, lane);
+  else dfl_q8_gu_impl<8u>(x, wq, ws, out, p, tg, sg, lane);
+}
+
+// ---- 2-Bit Proxy Screening + Exact Top-128 Rescoring ----
+struct DflP2BaseP { uint M, V, H, nblk; };
+
+template <uint M_MAX>
+NI_INLINE void dfl_p2_base_impl(const device float* x, const device uint2* p2_q, const device half* p2_s,
+                                const device float* fold_b, device half* out, constant DflP2BaseP& p,
+                                threadgroup float* xs, threadgroup float* xsum, uint tg, uint sg, uint lane) {
+  const uint v = (tg * 4u + sg) * 4u + (lane >> 3u), blk_loc = lane & 7u;
+  const bool valid = v < p.V;
+  float acc[M_MAX] = {};
+  for (uint blk0 = 0u; blk0 < p.nblk; blk0 += 8u) {
+    _Pragma("clang loop unroll(full)")
+    for (uint m = 0u; m < M_MAX; ++m) if (m < p.M) {
+      const device float* xm = x + size_t(m) * p.H + blk0 * 32u;
+      for (uint pass = 0u; pass < 2u; ++pass) {
+        const uint b = sg + pass * 4u;
+        const float xv = (blk0 + b < p.nblk) ? xm[b * 32u + lane] : 0.0f;
+        xs[m * 256u + b * 32u + lane] = xv;
+        const float s = simd_sum(xv);
+        if (lane == 0u) xsum[m * 8u + b] = s;
+      }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    const uint blk = blk0 + blk_loc;
+    if (valid && blk < p.nblk) {
+      const size_t idx = size_t(v) * p.nblk + blk;
+      const float sc = float(p2_s[idx]);
+      float4 c[8];
+      dfl_p2_unpack(p2_q[idx], c);
+      _Pragma("clang loop unroll(full)")
+      for (uint m = 0u; m < M_MAX; ++m) if (m < p.M)
+        acc[m] += dfl_p2_dot32(c, (const threadgroup float4*)(xs + m * 256u + blk_loc * 32u), xsum[m * 8u + blk_loc], sc);
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
   }
-  if (tid == 0u) tokens[p.tok_out_idx] = int(si[0]);
+  _Pragma("clang loop unroll(full)")
+  for (uint m = 0u; m < M_MAX; ++m) {
+    if (m >= p.M) break;
+    float vdot = acc[m];
+    vdot += simd_shuffle_xor(vdot, 1u); vdot += simd_shuffle_xor(vdot, 2u); vdot += simd_shuffle_xor(vdot, 4u);
+    if (blk_loc == 0u && valid) out[size_t(m) * p.V + v] = half(vdot + fold_b[v]);
+  }
+}
+
+[[kernel]] void dflare_p2_unembed_base(const device float* x [[buffer(0)]], const device uint2* p2_q [[buffer(1)]],
+                                       const device half* p2_s [[buffer(2)]], const device float* fold_b [[buffer(3)]],
+                                       device half* out [[buffer(4)]], constant DflP2BaseP& p [[buffer(5)]],
+                                       uint tg [[threadgroup_position_in_grid]], uint sg [[simdgroup_index_in_threadgroup]],
+                                       uint lane [[thread_index_in_simdgroup]]) {
+  threadgroup float xs[7 * 256], xsum[7 * 8];
+  if (p.M <= 4u) dfl_p2_base_impl<4u>(x, p2_q, p2_s, fold_b, out, p, xs, xsum, tg, sg, lane);
+  else dfl_p2_base_impl<7u>(x, p2_q, p2_s, fold_b, out, p, xs, xsum, tg, sg, lane);
+}
+
+struct DflP2ScreenP { uint V, R, has_sup, sup_words; };
+
+[[kernel]] void dflare_p2_fold_screen(const device float* x [[buffer(0)]], const device uint2* fold_p2_q [[buffer(1)]],
+                                      const device half* fold_p2_s [[buffer(2)]], const device half* base_proxy [[buffer(3)]],
+                                      const device uint* sup_mask [[buffer(4)]], device float* cand_v [[buffer(5)]],
+                                      device uint* cand_i [[buffer(6)]], constant DflP2ScreenP& p [[buffer(7)]],
+                                      uint tg [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]],
+                                      uint sg [[simdgroup_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]]) {
+  threadgroup float sh_x[256], sh_sum[8], sh_v[64];
+  threadgroup uint sh_i[64];
+  const float xv = x[sg * 32u + lane];
+  sh_x[sg * 32u + lane] = xv;
+  const float s = simd_sum(xv);
+  if (lane == 0u) sh_sum[sg] = s;
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+
+  float b0v = -INFINITY, b1v = -INFINITY;
+  uint b0i = 0xffffffffu, b1i = 0xffffffffu;
+  const uint ntg_row = (p.V + 31u) / 32u, blk = lane & 7u;
+  const threadgroup float4* xmp = (const threadgroup float4*)(sh_x + blk * 32u);
+  const float x0s = sh_sum[blk];
+  for (uint g = tg; g < ntg_row; g += 64u) {
+    const uint v = (g * 8u + sg) * 4u + (lane >> 3u);
+    const bool valid = v < p.V;
+    float acc = 0.0f;
+    if (valid) {
+      float4 c[8]; const size_t idx = size_t(v) * 8u + blk;
+      dfl_p2_unpack(fold_p2_q[idx], c); acc = dfl_p2_dot32(c, xmp, x0s, float(fold_p2_s[idx]));
+    }
+    acc += simd_shuffle_xor(acc, 1u); acc += simd_shuffle_xor(acc, 2u); acc += simd_shuffle_xor(acc, 4u);
+    if (blk == 0u && valid) {
+      const float val = dfl_tok_allowed(sup_mask, v, p.has_sup, p.sup_words) ? (float(base_proxy[v]) + acc) : -INFINITY;
+      dfl_top2(val, v, b0v, b0i, b1v, b1i);
+    }
+  }
+  if (blk == 0u) {
+    const uint slot = sg * 4u + (lane >> 3u);
+    sh_v[slot * 2u + 0u] = b0v; sh_i[slot * 2u + 0u] = b0i;
+    sh_v[slot * 2u + 1u] = b1v; sh_i[slot * 2u + 1u] = b1i;
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  if (tid == 0u) {
+    float t0v = -INFINITY, t1v = -INFINITY;
+    uint t0i = 0xffffffffu, t1i = 0xffffffffu;
+    for (uint j = 0u; j < 64u; ++j) if (sh_i[j] != 0xffffffffu) dfl_top2(sh_v[j], sh_i[j], t0v, t0i, t1v, t1i);
+    cand_v[tg * 2u + 0u] = t0v; cand_i[tg * 2u + 0u] = t0i;
+    cand_v[tg * 2u + 1u] = t1v; cand_i[tg * 2u + 1u] = t1i;
+  }
+}
+
+struct DflRescoreP { uint V, H, R, u_f32, has_sup, sup_words; };
+
+[[kernel]] void dflare_rescore_exact(const device float* x_u [[buffer(0)]], const device float* x_f [[buffer(1)]],
+                                     const device void* unembed [[buffer(2)]], const device uchar* fold_q [[buffer(3)]],
+                                     const device half* fold_s [[buffer(4)]], const device float* fold_b [[buffer(5)]],
+                                     const device uint* sup_mask [[buffer(6)]], const device uint* cand_i [[buffer(7)]],
+                                     device float* cand_v [[buffer(8)]], constant DflRescoreP& p [[buffer(9)]],
+                                     uint tg [[threadgroup_position_in_grid]], uint sg [[simdgroup_index_in_threadgroup]],
+                                     uint lane [[thread_index_in_simdgroup]]) {
+  const uint c = tg * 4u + sg, v = cand_i[c];
+  if (v >= p.V || !dfl_tok_allowed(sup_mask, v, p.has_sup, p.sup_words)) { if (lane == 0u) cand_v[c] = -INFINITY; return; }
+  float acc = 0.0f;
+  const size_t uoff = size_t(v) * p.H;
+  if (p.u_f32) {
+    const device float* uw = (const device float*)unembed + uoff;
+    for (uint k = lane * 4u; k < p.H; k += 128u) acc += dot(*(const device float4*)(x_u + k), *(const device float4*)(uw + k));
+  } else {
+    const device ushort* uw = (const device ushort*)unembed + uoff;
+    for (uint k = lane * 8u; k < p.H; k += 256u) {
+      const uint4 qu = *(const device uint4*)(uw + k);
+      acc += dot(*(const device float4*)(x_u + k + 0u), dfl_bf16_4(qu.xy)) + dot(*(const device float4*)(x_u + k + 4u), dfl_bf16_4(qu.zw));
+    }
+  }
+  const uint f_nblk = p.R >> 5u;
+  for (uint r = lane * 8u; r < p.R; r += 256u) {
+    const float sc = float(fold_s[size_t(v) * f_nblk + (r >> 5u)]);
+    const uint2 qf = *(const device uint2*)(fold_q + size_t(v) * p.R + r);
+    acc += (dot(*(const device float4*)(x_f + r + 0u), float4(as_type<char4>(qf.x))) +
+            dot(*(const device float4*)(x_f + r + 4u), float4(as_type<char4>(qf.y)))) * sc;
+  }
+  const float sum = simd_sum(acc);
+  if (lane == 0u) { const float val = sum + fold_b[v]; cand_v[c] = isnan(val) ? -INFINITY : val; }
+}
+
+struct DflArgmaxP { uint tok_out_idx; };
+
+[[kernel]] void dflare_argmax_128(const device float* cand_v [[buffer(0)]], const device uint* cand_i [[buffer(1)]],
+                                  device int* tokens [[buffer(2)]], constant DflArgmaxP& p [[buffer(3)]],
+                                  uint tid [[thread_index_in_threadgroup]]) {
+  threadgroup float sv[4]; threadgroup uint si[4];
+  const float v = cand_v[tid]; const uint idx = cand_i[tid], sg = tid >> 5u, lane = tid & 31u;
+  const float mv = simd_max(v); const uint mi = simd_min((v == mv && mv > -INFINITY) ? idx : 0xffffffffu);
+  if (lane == 0u) { sv[sg] = mv; si[sg] = mi; }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  if (sg == 0u) {
+    const float m2 = lane < 4u ? sv[lane] : -INFINITY, gv = simd_max(m2);
+    const uint i2 = lane < 4u ? si[lane] : 0xffffffffu, gi = simd_min((m2 == gv && gv > -INFINITY) ? i2 : 0xffffffffu);
+    if (lane == 0u) tokens[p.tok_out_idx] = (gi == 0xffffffffu) ? 0 : int(gi);
+  }
+}
+
+// ---- On-GPU Zero-Logits-D2H Speculative Acceptance ----
+struct DflAccP { uint pos, K; };
+
+[[kernel]] void dflare_accept_samples(device int* tokens [[buffer(0)]], const device int* samp [[buffer(1)]],
+                                      device int* accept_out [[buffer(2)]], constant DflAccP& p [[buffer(3)]],
+                                      uint lane [[thread_index_in_simdgroup]]) {
+  const bool stop = lane >= p.K || tokens[p.pos + 1u + lane] != samp[lane];
+  const uint a = simd_min(stop ? lane : 32u);
+  if (lane == 0u) {
+    const int bonus = samp[a];
+    tokens[p.pos + 1u + a] = bonus;
+    accept_out[0] = int(a); accept_out[1] = bonus;
+  }
 }

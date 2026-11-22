@@ -42,6 +42,11 @@ class Ink2DFlare {
   // (the anchor token at `pos`) and the committed context ring `[pos - ctx_len .. pos - 1]`.
   void encode_draft(Encoder& e, Seq& s, Ink2DFlareSeq& ds, int pos, int depth);
 
+  // On-GPU Zero-Logits-D2H lossless acceptance: samples verify rows 0..depth using the target sampler
+  // and writes accepted count `a` and bonus/correction token to `s.tok[pos + a + 1]`.
+  void encode_accept(Encoder& e, Seq& s, int pos, int depth, const Buffer& verify_logits, const SamplingParams& sp);
+  int accepted_count() const { return accept_out_.as<int>()[0]; }
+
  private:
   struct Q8Mat {
     Buffer q, s;
@@ -50,14 +55,15 @@ class Ink2DFlare {
   struct Layer {
     Buffer dflare_norm, input_norm, post_norm;
     Buffer q_norm, k_norm, k_norm_ctx;
-    Q8Mat q_proj, k_proj, v_proj, o_proj;
+    Q8Mat qkv_q, o_proj, gu_q, down_proj;
+    uint32_t qkv_offs[4] = {};
     Q8Mat k_proj_ctx, v_proj_ctx;
-    Q8Mat gate_proj, up_proj, down_proj;
   };
 
   void load();
   void alloc_buffers();
   void enc_q8(Encoder& e, const Q8Mat& w, const Buffer& x, const Buffer& y, int M, bool add = false);
+  void enc_q8_mv(Encoder& e, const Q8Mat& w, const Buffer& x, const Buffer& y, int M, bool add = false);
   void enc_rmsnorm(Encoder& e, const Buffer& x, const Buffer& w, const Buffer& out, int T);
 
   Inkling2& tg_;
@@ -70,15 +76,18 @@ class Ink2DFlare {
   std::vector<Layer> layers_;
   Buffer mask_embed_, norm_w_;
   Buffer mh_dflare_norm_, mh_w1_, mh_rnn_w_, mh_rnn_b_;
-  Buffer fold_q_, fold_s_, fold_b_;  // folded unembed @ hidden_out (Q8_0 [V, 256] + F32 [V])
+  Buffer fold_q_, fold_s_, fold_b_;              // folded unembed @ hidden_out (Q8_0 [V, 256] + F32 [V])
+  Buffer unembed_p2_q_, unembed_p2_s_;           // 2-bit proxy for unembed [V, H]
+  Buffer fold_p2_q_, fold_p2_s_;                 // 2-bit proxy for folded head [V, 256]
   std::vector<Buffer> owned_bufs_;
 
   // Reusable scratch buffers
-  Buffer ctx_h_, ctx_k_, ctx_v_;              // commit scratch (up to 64 rows per batch)
-  Buffer bx_, bn_, bq_, bk_, bv_, batt_;      // block scratch (B <= 8)
-  Buffer bgate_, bup_, bact_, draft_h_;       // MLP + final hidden (B <= 8)
-  Buffer base_logits_, pick_v_, pick_i_;
+  Buffer ctx_h_, ctx_k_, ctx_v_;                 // commit scratch (up to 64 rows per batch)
+  Buffer bx_, bn_, bq_, bk_, bv_, batt_;         // block scratch (B <= 8)
+  Buffer bact_, draft_h_;                        // MLP activation + final hidden (B <= 8)
+  Buffer base_proxy_, pick_v_, pick_i_;          // 2-bit screening [depth, V] fp16 + top-128 shortlist
   Buffer mh_state_, mh_rnn_in_, mh_latent_;
+  Buffer acc_cv_, acc_ci_, acc_samp_, acc_sprob_, acc_dstep_, accept_out_;
 };
 
 }  // namespace ni

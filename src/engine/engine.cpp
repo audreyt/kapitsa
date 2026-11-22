@@ -992,7 +992,7 @@ MemPlan model_plan(const std::string& model_dir, int prefill_chunk) {
   if (Inkling2::is_model(model_dir) && Ink2DFlare::is_available(model_dir)) {
     const Ink2Config ic = Inkling2::read_config(model_dir);
     const size_t pf_rows = size_t(prefill_chunk_room(prefill_chunk > 0 ? prefill_chunk : 512));
-    p.mtp += 450ull * 1024ull * 1024ull;  // 0.44 GB Q8 DFlare drafter + folded Markov head
+    p.mtp += 620ull * 1024ull * 1024ull;  // ~0.60 GB Q8 DFlare drafter + folded head + 2-bit proxies
     p.activations += 4 * (pf_rows + size_t(Inkling2::kMaxVerify)) * size_t(ic.hidden) * 4 +
                      size_t(Inkling2::kMaxVerify) * size_t(ic.vocab) * 4;
     p.slot_state += 3ull * 2ull * 1023ull * 1024ull * 2ull;  // 3-layer DFlare context ring (12.6 MB/slot)
@@ -3372,14 +3372,6 @@ ChatResult Engine::chat(const ChatRequest& r_in, const std::function<bool(const 
   // path whose drafts equal those samples, so every token is the target's own draw), so its drafter stays on, outside
   // batches. The other speculative loops' verifies and acceptances keep 64 candidates per row: plain steps there.
   // (Clover's own loops draw from the whole vocabulary already, its pick kernel applying no top-k: they are kept.)
-  const bool full_tree = full_vocab(sp) && lili_ && kf_budget_;
-  const bool full_steps = full_vocab(sp) && !clover_own && !full_tree;
-  if (full_steps)
-    logi("chat: top_k %d at temperature %.2f: sampled over the whole vocabulary, plain steps (kapitsa#1286)", sp.top_k,
-         sp.temperature);
-  else if (full_tree)
-    logi("chat: top_k %d at temperature %.2f: sampled over the whole vocabulary, in KFlash's tree verify (kapitsa#1286)",
-         sp.top_k, sp.temperature);
   // Structured output: the matcher's state. A reply held from its first token samples that token (in the prompt's last
   // chunk) under the grammar's first mask; with reasoning on the grammar starts after </think>.
   GrammarState gst;
@@ -3438,6 +3430,18 @@ ChatResult Engine::chat(const ChatRequest& r_in, const std::function<bool(const 
            "controls apply)", cap);
     }
   }
+  const bool full_tree = full_vocab(sp) && lili_ && kf_budget_;
+  const bool ink2_full = full_vocab(sp) && ink2_dfl_ && slot.ink2_dseq && !gm && !tc.on();
+  const bool full_steps = full_vocab(sp) && !clover_own && !full_tree && !ink2_full;
+  if (full_steps)
+    logi("chat: top_k %d at temperature %.2f: sampled over the whole vocabulary, plain steps (kapitsa#1286)", sp.top_k,
+         sp.temperature);
+  else if (full_tree)
+    logi("chat: top_k %d at temperature %.2f: sampled over the whole vocabulary, in KFlash's tree verify (kapitsa#1286)",
+         sp.top_k, sp.temperature);
+  else if (ink2_full)
+    logi("chat: top_k %d at temperature %.2f: sampled over the whole vocabulary, in DFlare verify (kapitsa#1286)",
+         sp.top_k, sp.temperature);
   double t0 = now_ms();
   const int C = prefill_chunk_for(n - start);
   int p = start;
@@ -4174,99 +4178,8 @@ ChatResult Engine::chat(const ChatRequest& r_in, const std::function<bool(const 
   } else if (ink2_dfl_ && slot.ink2_dseq && !gm && !tc.on()) {
     // Inkling-2-Mini bundled DFlare/DSpark speculative decoding (mtp.safetensors):
     // tokens[P] is the pending anchor token; each cycle fuses previous conv rollback + tap commit +
-    // DFlare block draft (depth d) + Inkling-2 parallel verify (d + 1 rows) into one command buffer.
-    const int V = ink2_->vocab();
-    const bool greedy = sp.temperature <= 0.0f;
-    const float inv_t = greedy ? 1.0f : (1.0f / sp.temperature);
-    auto splitmix = [](uint64_t x) -> double {
-      x += 0x9e3779b97f4a7c15ULL;
-      x = (x ^ (x >> 30)) * 0xbf58476d1ce4e5b9ULL;
-      x = (x ^ (x >> 27)) * 0x94d049bb133111ebULL;
-      x ^= x >> 31;
-      return double(x >> 11) * (1.0 / double(1ULL << 53));
-    };
-    auto argmax_row = [V](const float* row) -> int {
-      int best = 0;
-      float bv = row[0];
-      for (int i = 1; i < V; ++i) {
-        if (row[i] > bv) {
-          bv = row[i];
-          best = i;
-        }
-      }
-      return best;
-    };
-    std::vector<std::pair<int, float>> active;
-    active.reserve(256);
-    auto build_probs = [&](const float* row) {
-      float mx = row[0];
-      for (int i = 1; i < V; ++i)
-        if (row[i] > mx) mx = row[i];
-      // Sparse active set: exp(-18) = 1.5e-8 is negligible in FP32, avoiding 200K expf + nth_element per verify row.
-      // Match sample.metal's exact transformation order: top-k, then top-p on the untempered
-      // distribution exp(logit - mx), then temperature scaling exp((logit - mx) / T).
-      const float cutoff = mx - 18.0f * std::max(1.0f, sp.temperature);
-      active.clear();
-      for (int i = 0; i < V; ++i)
-        if (row[i] >= cutoff) active.emplace_back(i, row[i]);
-      if (sp.top_k > 0 && int(active.size()) > sp.top_k) {
-        std::nth_element(active.begin(), active.begin() + sp.top_k, active.end(),
-                         [](const auto& a, const auto& b) { return a.second > b.second; });
-        active.resize(size_t(sp.top_k));
-      }
-      if (sp.top_p > 0.0f && sp.top_p < 1.0f && active.size() > 1) {
-        std::sort(active.begin(), active.end(),
-                  [](const auto& a, const auto& b) { return a.second > b.second; });
-        double utot = 0.0;
-        for (const auto& kv : active) utot += std::exp(kv.second - mx);
-        double cum = 0.0;
-        size_t keep = active.size();
-        for (size_t r = 0; r < active.size(); ++r) {
-          cum += std::exp(active[r].second - mx) / utot;
-          if (cum >= double(sp.top_p)) {
-            keep = r + 1;
-            break;
-          }
-        }
-        active.resize(keep);
-      }
-      double sum = 0.0;
-      for (auto& kv : active) {
-        kv.second = std::exp((kv.second - mx) * inv_t);
-        sum += kv.second;
-      }
-      const float inv_s = sum > 0.0 ? float(1.0 / sum) : 0.0f;
-      for (auto& kv : active) kv.second *= inv_s;
-    };
-    auto prob_of = [&](int id) -> float {
-      for (const auto& kv : active)
-        if (kv.first == id) return kv.second;
-      return 0.0f;
-    };
-    auto sample_probs = [&](int exclude_id, double u) -> int {
-      double tot = 1.0;
-      if (exclude_id >= 0 && exclude_id < V) {
-        tot -= double(prob_of(exclude_id));
-        if (tot <= 1e-9) {
-          int best = active.empty() ? 0 : active[0].first;
-          float bv = -1.0f;
-          for (const auto& kv : active)
-            if (kv.second > bv) bv = kv.second, best = kv.first;
-          return best;
-        }
-      }
-      const double target = u * tot;
-      double acc = 0.0;
-      int last_nz = active.empty() ? 0 : active[0].first;
-      for (const auto& kv : active) {
-        if (kv.first == exclude_id || kv.second <= 0.0f) continue;
-        last_nz = kv.first;
-        acc += kv.second;
-        if (acc >= target) return kv.first;
-      }
-      return last_nz;
-    };
-
+    // DFlare block draft (depth d) + Inkling-2 parallel verify (d + 1 rows) + Zero-Logits-D2H GPU accept
+    // into one command buffer.
     int P = n;
     bool go = handle(s.tokens()[n]);
     int cur_d = ink2_spec_auto_ ? std::min(2, ink2_spec_) : ink2_spec_;
@@ -4326,43 +4239,11 @@ ChatResult Engine::chat(const ChatRequest& r_in, const std::function<bool(const 
         }
         ink2_dfl_->encode_draft(*e2, s, *slot.ink2_dseq, P, d);
         ink2_->encode_verify(*e2, s, P, d + 1, ink2_vf_logits_, &ink2_vf_taps_, true);
+        ink2_dfl_->encode_accept(*e2, s, P, d, ink2_vf_logits_, sp);
         e2->commit_and_wait();
       }
-      const float* vl = ink2_vf_logits_.as<float>();
       int* tk = s.tokens();
-      int a = 0;
-      int bonus = 0;
-      if (greedy) {
-        for (int k = 0; k < d; ++k) {
-          int tgt = argmax_row(vl + size_t(k) * size_t(V));
-          if (tgt == tk[P + 1 + k]) {
-            ++a;
-          } else {
-            bonus = tgt;
-            break;
-          }
-        }
-        if (a == d) bonus = argmax_row(vl + size_t(d) * size_t(V));
-      } else {
-        for (int k = 0; k < d; ++k) {
-          build_probs(vl + size_t(k) * size_t(V));
-          int drf = tk[P + 1 + k];
-          double u = splitmix(uint64_t(sp.seed) ^ (uint64_t(P + k) * 0x9e3779b97f4a7c15ULL));
-          if (drf >= 0 && drf < V && u < double(prob_of(drf))) {
-            ++a;
-          } else {
-            double u2 = splitmix(uint64_t(sp.seed) ^ (uint64_t(P + k) * 0xbf58476d1ce4e5b9ULL) ^ 1ULL);
-            bonus = sample_probs(drf, u2);
-            break;
-          }
-        }
-        if (a == d) {
-          build_probs(vl + size_t(d) * size_t(V));
-          double u = splitmix(uint64_t(sp.seed) ^ (uint64_t(P + d) * 0x9e3779b97f4a7c15ULL));
-          bonus = sample_probs(-1, u);
-        }
-      }
-      tk[P + a + 1] = bonus;
+      const int a = ink2_dfl_->accepted_count();
       int m = 0;
       while (m < a + 1) {
         ++m;
