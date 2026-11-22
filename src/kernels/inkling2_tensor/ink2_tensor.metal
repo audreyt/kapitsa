@@ -17,7 +17,7 @@ struct Ink2MsgPrepP { uint T, H; float eps; };
 struct Ink2MsgMixP { uint n; };
 struct Ink2BucketP { uint T, K_top, E; };
 struct Ink2MoeTP { uint T, H, I, K_top; };
-struct Ink2AttnPfTP { uint T, pos0, kv_cap, Hq, Hkv, D, rel_extent, is_swa, swa; float scale; };
+struct Ink2AttnPfTP { uint T, pos0, kv_cap, Hq, Hkv, D, rel_extent, is_swa, swa; float scale; uint kv_fp8; };
 
 NI_INLINE float ink2t_e4m3_16384(uint b) {
   return float(as_type<half>(ushort(((b & 0x80u) << 8) | ((b & 0x7Fu) << 7)))) * 4194304.0f;
@@ -442,21 +442,32 @@ NI_INLINE void ink2t_moe_w2_impl(
 }
 
 // ---- 4. Metal 4 Tiled Flash Relative-Position Sink Attention Prefill (T >= 32, D == 128, <= 16 KB tgmem) ----
-NI_INLINE void ink2t_load_kv(threadgroup half* kv_tile, const device half* src, uint tid, uint hkv, uint k0,
-                             uint k_min_need, uint k_last, uint kv_cap, uint Hkv, uint is_swa) {
+NI_INLINE void ink2t_load_kv(threadgroup half* kv_tile, const device void* src, uint tid, uint hkv, uint k0,
+                             uint k_min_need, uint k_last, uint kv_cap, uint Hkv, uint is_swa, uint kv_fp8) {
   for (uint i = tid; i < 32u * 16u; i += 128) {
     const uint r = i >> 4, c8 = (i & 15u) * 8, kp = k0 + r;
     uint4 v = uint4(0);
     if (kp >= k_min_need && kp <= k_last) {
       const uint slot = is_swa ? (kp % kv_cap) : kp;
-      v = *(const device uint4*)(src + (size_t(slot) * Hkv + hkv) * 128u + c8);
+      const size_t base = (size_t(slot) * Hkv + hkv) * 128u + c8;
+      if (kv_fp8) {
+        const uint2 p8 = *(const device uint2*)((const device uchar*)src + base);
+        *(threadgroup half4*)(kv_tile + r * 128u + c8 + 0u) = half4(
+            ink2t_e4m3(p8.x & 0xFFu), ink2t_e4m3((p8.x >> 8) & 0xFFu),
+            ink2t_e4m3((p8.x >> 16) & 0xFFu), ink2t_e4m3(p8.x >> 24));
+        *(threadgroup half4*)(kv_tile + r * 128u + c8 + 4u) = half4(
+            ink2t_e4m3(p8.y & 0xFFu), ink2t_e4m3((p8.y >> 8) & 0xFFu),
+            ink2t_e4m3((p8.y >> 16) & 0xFFu), ink2t_e4m3(p8.y >> 24));
+        continue;
+      }
+      v = *(const device uint4*)((const device half*)src + base);
     }
     *(threadgroup uint4*)(kv_tile + r * 128u + c8) = v;
   }
 }
 
 [[kernel, max_total_threads_per_threadgroup(128)]] void ink2_attn_prefill_t(
-    const device float* q [[buffer(0)]], const device half* kc [[buffer(1)]], const device half* vc [[buffer(2)]],
+    const device float* q [[buffer(0)]], const device void* kc [[buffer(1)]], const device void* vc [[buffer(2)]],
     const device float* rb [[buffer(3)]], const device float* sinks [[buffer(4)]], const device float* gate [[buffer(5)]],
     device float* out [[buffer(6)]], constant Ink2AttnPfTP& p [[buffer(7)]], uint2 tg [[threadgroup_position_in_grid]],
     uint tid [[thread_index_in_threadgroup]], uint sg [[simdgroup_index_in_threadgroup]],
@@ -502,7 +513,7 @@ NI_INLINE void ink2t_load_kv(threadgroup half* kv_tile, const device half* src, 
   float row_m[4] = {-INFINITY, -INFINITY, -INFINITY, -INFINITY}, row_l[4] = {0.0f, 0.0f, 0.0f, 0.0f};
   const uint col = sg * 32 + lane;
   for (uint k0 = k_first; k0 <= k_last; k0 += BK) {
-    ink2t_load_kv(kv_tile, kc, tid, hkv, k0, k_min_need, k_last, p.kv_cap, p.Hkv, p.is_swa);
+    ink2t_load_kv(kv_tile, kc, tid, hkv, k0, k_min_need, k_last, p.kv_cap, p.Hkv, p.is_swa, p.kv_fp8);
     threadgroup_barrier(mem_flags::mem_threadgroup);
     if (sg < 2u) qk_op.run(tQ, tK, tS);
     threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -529,7 +540,7 @@ NI_INLINE void ink2t_load_kv(threadgroup half* kv_tile, const device half* src, 
     }
 
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    ink2t_load_kv(kv_tile, vc, tid, hkv, k0, k_min_need, k_last, p.kv_cap, p.Hkv, p.is_swa);
+    ink2t_load_kv(kv_tile, vc, tid, hkv, k0, k_min_need, k_last, p.kv_cap, p.Hkv, p.is_swa, p.kv_fp8);
     threadgroup_barrier(mem_flags::mem_threadgroup);
     _Pragma("clang loop unroll(full)")
     for (uint16_t i = 0; i < acc_o.get_capacity(); ++i) {

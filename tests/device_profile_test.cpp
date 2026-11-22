@@ -84,7 +84,7 @@ int main() {
   CHECK(ni::default_matches(*wave, faked));
   CHECK(ni::default_matches(*hist, faked));
 
-  CHECK(ni::default_count() == 21);  // +1: 9B mixed-format catalog policy (#493); +1: kflash_block16; +1: ane_proj_fast; +1: a4_qtm_fast; +1: ink2_tensor_fast
+  CHECK(ni::default_count() == 22);  // +1: 9B mixed-format catalog policy (#493); +1: kflash_block16; +1: ane_proj_fast; +1: a4_qtm_fast; +1: ink2_tensor_fast; +1: ink2_q8_dense_fast
   {
     const auto* ink2t = row("ink2_tensor_fast");
     const ni::ModelFacts any;
@@ -93,6 +93,16 @@ int main() {
     CHECK(ni::default_on(ni::Knob::kInk2TensorFast, m5max, any) && ni::default_on(ni::Knob::kInk2TensorFast, m5pro, any));
     CHECK(!ni::default_on(ni::Knob::kInk2TensorFast, ni::resolve_device(mac(9, 20, "Apple M4 Pro", g48)), any));
     CHECK(!ni::default_on(ni::Knob::kInk2TensorFast, ni::resolve_device(mac(7, 8, "Apple M1", 16L << 30)), any));
+  }
+  {
+    const auto* q8d = row("ink2_q8_dense_fast");
+    const ni::ModelFacts any;
+    CHECK(q8d && q8d->knob == ni::Knob::kInk2Q8DenseFast && q8d->scope == ni::DefaultScope::kMatrix && !q8d->exclusive &&
+          q8d->live);
+    CHECK(ni::default_on(ni::Knob::kInk2Q8DenseFast, m5max, any) &&
+          ni::default_on(ni::Knob::kInk2Q8DenseFast, m5pro, any));
+    CHECK(!ni::default_on(ni::Knob::kInk2Q8DenseFast, ni::resolve_device(mac(9, 20, "Apple M4 Pro", g48)), any));
+    CHECK(!ni::default_on(ni::Knob::kInk2Q8DenseFast, ni::resolve_device(mac(7, 8, "Apple M1", 16L << 30)), any));
   }
   // ane_proj_fast: the 27B on the Apple M6 by name (slower on the M5 Pro; the 4B was over its bar; the fast profile reads it)
   const ni::DefaultRow* proj = row("ane_proj_fast");

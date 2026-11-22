@@ -168,6 +168,11 @@ const DefaultRow kDefaults[] = {
     // 3 interleaved rounds: 663-5,701 tok prefill +712 to +811% (38 tok +73%); 192 step rows: 0 flips, mean KL 9.58e-4.
     {"ink2_tensor_fast", Knob::kInk2TensorFast, ModelClass::kOther, DefaultScope::kMatrix, nullptr, "on", 712, 811,
      false, "M5 Max; fast profile only", true},
+    // Fast profile only (docs/profiles.md): Inkling-2-Mini Q8_0 dense MV (qkvrsg, wo_ud, unembed at M <= 8;
+    // NI_INK2_Q8_DENSE / NI_INK2_Q8_HEAD). M5 Max, bench_kapitsa_ink2: 62.62 -> 64.77 tok/s (+3.4%, explain +8.5%);
+    // 192 step rows vs precise: 0 top-1 flips (1.0000), mean KL 1.623e-3.
+    {"ink2_q8_dense_fast", Knob::kInk2Q8DenseFast, ModelClass::kOther, DefaultScope::kMatrix, nullptr, "on", 3, 0,
+     false, "M5 Max; fast profile only", true},
 };
 
 bool guard_matches(const char* id, const DeviceProfile& dev) {

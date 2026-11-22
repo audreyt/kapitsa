@@ -72,6 +72,22 @@ bool want_ink2_tensor() {
   return on;
 }
 
+bool want_ink2_q8_dense() {
+  static const bool on = [] {
+    const bool here = default_on(Knob::kInk2Q8DenseFast, ModelFacts{});
+    return profile_switch("NI_INK2_Q8_DENSE", here, "Inkling-2 Q8_0 dense MV (NI_INK2_Q8_DENSE)");
+  }();
+  return on;
+}
+
+bool want_ink2_kv_fp8() {
+  static const bool on = [] {
+    const char* v = getenv("NI_INK2_KV_FP8");
+    return v && *v && atoi(v) != 0;
+  }();
+  return on;
+}
+
 bool init_tensor_kernels() {
   static std::mutex mu;
   std::lock_guard<std::mutex> lk(mu);
@@ -132,7 +148,8 @@ void prewarm_pipelines() {
       "ink2_moe_nvfp4_w13_situ","ink2_moe_nvfp4_w2_acc", "ink2_moe_mxfp8_w13_situ","ink2_moe_mxfp8_w2_acc",
       "ink2_moe_bucket_small", "ink2_moe_nvfp4_w13_g",   "ink2_moe_nvfp4_w2_g",   "ink2_moe_mxfp8_w13_g",
       "ink2_moe_mxfp8_w2_g",   "ink2_moe_reduce8_m3",    "ink2_mtp_argmax_stage1","ink2_mtp_argmax_stage2",
-      "ink2_softcap",
+      "ink2_softcap",          "ink2_quant_q8_bf16",     "ink2_q8_mv4",           "ink2_q8_mv8",
+      "ink2_q8_mv4_multi6",    "ink2_q8_mv8_multi6",
   };
   for (const char* n : kInk2Names) (void)ink2_pipe(n);
   (void)base_pipe("topk_stage1");
@@ -167,6 +184,17 @@ struct Ink2MultiMmP {
   uint32_t offs[7];
   uint32_t lens[6];
 };
+struct Ink2QuantQ8P {
+  uint32_t total_blocks;
+};
+struct Ink2Q8MmP {
+  uint32_t M, N, K, nblk, add;
+};
+struct Ink2Q8Multi6P {
+  uint32_t M, K, N_tot, n_segs, nblk;
+  uint32_t offs[7];
+  uint32_t lens[6];
+};
 struct Ink2SconvStaticP {
   uint32_t T, C, w_f32, save_snap, snap_stride, add_res;
   float scale;
@@ -177,6 +205,7 @@ struct Ink2SconvDynP {
 struct Ink2QkvrP {
   uint32_t T, Hq, Hkv, D, d_rel, pos0, kv_cap, is_swa, scale_f32;
   float qk_clip, r_clip, v_eps, log_floor, log_alpha;
+  uint32_t kv_fp8;
 };
 struct Ink2RelP {
   uint32_t T, Hq, d_rel, extent, proj_f32;
@@ -184,14 +213,17 @@ struct Ink2RelP {
 struct Ink2AttnDecP {
   uint32_t pos, kv_cap, Hq, Hkv, D, rel_extent, is_swa, swa, chunk, nchunks;
   float scale;
+  uint32_t kv_fp8;
 };
 struct Ink2AttnVerP {
   uint32_t T, pos0, kv_cap, Hq, Hkv, D, rel_extent, is_swa, swa, chunk, nchunks;
   float scale;
+  uint32_t kv_fp8;
 };
 struct Ink2AttnPfP {
   uint32_t T, pos0, kv_cap, Hq, Hkv, D, rel_extent, is_swa, swa;
   float scale;
+  uint32_t kv_fp8;
 };
 struct Ink2RouteP {
   uint32_t T, E, K, bias_f32;
@@ -480,6 +512,13 @@ Inkling2::Inkling2(const std::string& path, int prefill_chunk) {
   ink2::compile_kernels();
   prewarm_pipelines();
   use_tensor_ = want_ink2_tensor() && init_tensor_kernels();
+  use_q8_dense_ = want_ink2_q8_dense() && (cfg_.hidden & 255) == 0 && ((cfg_.hq * cfg_.head_dim) & 255) == 0;
+  use_kv_fp8_ = want_ink2_kv_fp8();
+  if (const char* he = getenv("NI_INK2_Q8_HEAD"); he && *he) {
+    use_q8_head_ = (atoi(he) != 0) && (cfg_.hidden & 255) == 0;
+  } else {
+    use_q8_head_ = use_q8_dense_;
+  }
   load();
 }
 
@@ -701,6 +740,36 @@ void Inkling2::load() {
   }
 
   Gpu::get().make_resident(ws_.buffers());
+  if (use_q8_dense_ || use_q8_head_) {
+    auto e_q = Gpu::get().begin();
+    auto quant_mat = [&](const Buffer& src, size_t rows, size_t cols, Buffer& out_q, Buffer& out_s, const char* tag) {
+      const uint32_t tblks = uint32_t(rows * (cols / 32));
+      out_q = Gpu::get().alloc(rows * cols, tag);
+      out_s = Gpu::get().alloc(size_t(tblks) * 2, tag);
+      owned_bufs_.push_back(out_q);
+      owned_bufs_.push_back(out_s);
+      const Ink2QuantQ8P qp{tblks};
+      e_q->use(ink2_pipe("ink2_quant_q8_bf16"));
+      e_q->buf(0, src);
+      e_q->buf(1, out_q);
+      e_q->buf(2, out_s);
+      e_q->val(3, qp);
+      e_q->dispatch((tblks + 3) / 4, 1, 1, 128);
+    };
+    if (use_q8_dense_) {
+      const size_t H = size_t(cfg_.hidden);
+      const size_t QD = size_t(cfg_.hq) * size_t(cfg_.head_dim);
+      for (int i = 0; i < cfg_.num_layers; ++i) {
+        Ink2Layer& L = layers_[size_t(i)];
+        if (L.qkvrsg_w) quant_mat(L.qkvrsg_w, L.qkvrsg_offs[6], H, L.qkvrsg_q, L.qkvrsg_s, "ink2_qkvrsg_q8");
+        if (L.wo_ud && L.wo_ud->dtype == DType::BF16) quant_mat(L.wo_ud->buf, H, QD, L.wo_q, L.wo_s, "ink2_wo_q8");
+      }
+    }
+    if (use_q8_head_ && unembed_ && unembed_->dtype == DType::BF16) {
+      quant_mat(unembed_->buf, size_t(cfg_.vocab), size_t(cfg_.hidden), unembed_q_, unembed_s_, "ink2_head_q8");
+    }
+    e_q->commit_and_wait();
+  }
   const char* mtp_env = getenv("NI_INK2_MTP");
   const bool want_mtp = !(mtp_env && *mtp_env && atoi(mtp_env) == 0);
   if (want_mtp && Ink2Mtp::exists(path_)) {
@@ -708,8 +777,9 @@ void Inkling2::load() {
   }
   alloc_buffers();
   Gpu::get().make_resident(owned_bufs_);
-  logi("loaded %s: Inkling-2-Mini (24 layers / 48 visits, vocab %d), %.2f GB text weights in %.0f ms",
-       path_.c_str(), cfg_.vocab, ws_.total_bytes() / 1e9, now_ms() - t0);
+  logi("loaded %s: Inkling-2-Mini (24 layers / 48 visits, vocab %d, q8_dense=%d, q8_head=%d, kv_fp8=%d), %.2f GB text weights in %.0f ms",
+       path_.c_str(), cfg_.vocab, use_q8_dense_ ? 1 : 0, use_q8_head_ ? 1 : 0, use_kv_fp8_ ? 1 : 0,
+       ws_.total_bytes() / 1e9, now_ms() - t0);
 }
 
 void Inkling2::alloc_buffers() {
@@ -811,16 +881,17 @@ std::unique_ptr<Seq> Inkling2::new_seq(int limit, int initial) {
 
 bool Inkling2::ensure_rings(Seq& s) {
   Gpu& g = Gpu::get();
-  const size_t row = size_t(cfg_.hkv) * size_t(cfg_.head_dim) * 2;
+  const size_t kvd = size_t(cfg_.hkv) * size_t(cfg_.head_dim);
   const size_t nv = s.kc.size();
   size_t need = 0;
   for (size_t v = 0; v < nv; ++v)
-    if (is_swa_slot(v) && !s.kc[v]) need += 2 * row * size_t(ring_rows_);
+    if (is_swa_slot(v) && !s.kc[v]) need += 2 * kvd * kv_elem_bytes(v) * size_t(ring_rows_);
   if (!need) return true;
   if (mem_budget_ && g.allocated_bytes() + need > mem_budget_) return false;
   std::vector<Buffer> add;
   for (size_t v = 0; v < nv; ++v)
     if (is_swa_slot(v) && !s.kc[v]) {
+      const size_t row = kvd * kv_elem_bytes(v);
       s.kc[v] = g.alloc(row * size_t(ring_rows_), "ink2_kv_ring");
       s.vc[v] = g.alloc(row * size_t(ring_rows_), "ink2_kv_ring");
       memset(s.kc[v].ptr(), 0, s.kc[v].size);
@@ -837,9 +908,9 @@ bool Inkling2::reserve(Seq& s, int need) {
   if (need > s.limit) return false;
   Gpu& g = Gpu::get();
   const size_t per = kv_bytes_per_pos();
-  const size_t row = size_t(cfg_.hkv) * size_t(cfg_.head_dim) * 2;
+  const size_t kvd = size_t(cfg_.hkv) * size_t(cfg_.head_dim);
   auto round_up = [](int v, int m) { return (v + m - 1) / m * m; };
-  size_t rings = s.kc[0] ? 0 : ring_bytes_per_seq(cfg_, tmax_);
+  size_t rings = s.kc[0] ? 0 : (use_kv_fp8_ ? ring_bytes_per_seq(cfg_, tmax_) / 2 : ring_bytes_per_seq(cfg_, tmax_));
   if (!s.kc[0] && mtp_) rings += Ink2Mtp::ring_bytes_per_seq(mtp_->config(), ring_rows_);
   auto fits = [&](int c) {
     const size_t copy = std::min(size_t(256) << 20, size_t(s.cap) * per);
@@ -850,7 +921,6 @@ bool Inkling2::reserve(Seq& s, int need) {
   if (!fits(target)) return false;
 
   const size_t nv = s.kc.size();
-  const size_t nb = row * size_t(target);
   const int old = s.cap;
   std::vector<Buffer> olds, news;
   std::unique_ptr<Encoder> e;
@@ -864,6 +934,8 @@ bool Inkling2::reserve(Seq& s, int need) {
   };
   for (size_t v = 0; v < nv; ++v) {
     if (is_swa_slot(v)) continue;
+    const size_t row = kvd * kv_elem_bytes(v);
+    const size_t nb = row * size_t(target);
     for (Buffer* b : {&s.kc[v], &s.vc[v]}) {
       if (batch && batch + nb > (size_t(256) << 20)) flush();
       Buffer nbuf = g.alloc(nb, "ink2_kv_global");
@@ -885,7 +957,7 @@ bool Inkling2::reserve(Seq& s, int need) {
 }
 
 size_t Inkling2::kv_bytes_per_pos() const {
-  return kv_per_pos(cfg_) + (mtp_ ? Ink2Mtp::kv_per_pos(mtp_->config()) : 0);
+  return (use_kv_fp8_ ? kv_per_pos(cfg_) / 2 : kv_per_pos(cfg_)) + (mtp_ ? Ink2Mtp::kv_per_pos(mtp_->config()) : 0);
 }
 
 void Inkling2::drop_kv(Seq& s) {
@@ -1150,9 +1222,29 @@ void Inkling2::enc_msg_gate3(Encoder& e, const Ink2Layer& L, const Buffer* const
   if (!batched_mg) e.group_end();
 }
 
+void Inkling2::enc_q8_mv(Encoder& e, const Buffer& wq, const Buffer& ws, uint32_t N, uint32_t K, const Buffer& x,
+                         const Buffer& y, int M, bool add) {
+  const uint32_t nblk = K / 32u;
+  for (int m0 = 0; m0 < M; m0 += 8) {
+    const uint32_t mc = uint32_t(std::min(8, M - m0));
+    const Ink2Q8MmP p{mc, N, K, nblk, add ? 1u : 0u};
+    e.use(ink2_pipe(mc <= 4u ? "ink2_q8_mv4" : "ink2_q8_mv8"));
+    e.buf(0, x.view(size_t(m0) * K * 4, size_t(mc) * K * 4));
+    e.buf(1, wq);
+    e.buf(2, ws);
+    e.buf(3, y.view(size_t(m0) * N * 4, size_t(mc) * N * 4));
+    e.val(4, p);
+    e.dispatch((N + 15u) / 16u, 1, 1, 128);
+  }
+}
+
 void Inkling2::enc_unembed(Encoder& e, const Buffer& x, const Buffer& y, int M, bool apply_softcap) {
   const uint32_t V = uint32_t(cfg_.vocab);
-  enc_mm(e, *unembed_, x, y, M, V, false);
+  if (M <= 8 && unembed_q_) {
+    enc_q8_mv(e, unembed_q_, unembed_s_, V, uint32_t(cfg_.hidden), x, y, M, false);
+  } else {
+    enc_mm(e, *unembed_, x, y, M, V, false);
+  }
   if (apply_softcap) {
     const Ink2SoftcapP sp{uint32_t(M) * V, cfg_.logit_softcap, 1.0f / cfg_.logit_softcap};
     e.use(ink2_pipe("ink2_softcap"));
@@ -1292,7 +1384,25 @@ void Inkling2::enc_forward(Encoder& e, Seq& s, int pos0, int T, bool dump_logits
     const Buffer& vn = (has_msgs || !L.is_swa) ? n2_ : n0_;
 
     const bool pf_sconv_kv = L.is_swa && T >= 16 && !save_conv_snaps && KVD <= H;
-    if (L.qkvrsg_w && T <= 8 && (H & 7u) == 0u) {
+    if (L.qkvrsg_q && T <= 8 && (H & 255u) == 0u) {
+      Ink2Q8Multi6P mp{uint32_t(T), H, L.qkvrsg_offs[6], 6u, H / 32u, {}, {}};
+      for (uint32_t i = 0; i < 7u; ++i) mp.offs[i] = L.qkvrsg_offs[i];
+      for (uint32_t i = 0; i < 6u; ++i) mp.lens[i] = L.qkvrsg_lens[i];
+      e.use(ink2_pipe(T <= 4 ? "ink2_q8_mv4_multi6" : "ink2_q8_mv8_multi6"));
+      e.buf(0, n0_);
+      e.buf(1, kn);
+      e.buf(2, vn);
+      e.buf(3, L.qkvrsg_q);
+      e.buf(4, L.qkvrsg_s);
+      e.buf(5, q_);
+      e.buf(6, r_);
+      e.buf(7, sinks_);
+      e.buf(8, gate_attn_);
+      e.buf(9, k_);
+      e.buf(10, v_);
+      e.val(11, mp);
+      e.dispatch((mp.N_tot + 15) / 16, 1, 1, 128);
+    } else if (L.qkvrsg_w && T <= 8 && (H & 7u) == 0u) {
       Ink2MultiMmP mp{uint32_t(T), H, L.qkvrsg_offs[6], 6u, {}, {}};
       for (uint32_t i = 0; i < 7u; ++i) mp.offs[i] = L.qkvrsg_offs[i];
       for (uint32_t i = 0; i < 6u; ++i) mp.lens[i] = L.qkvrsg_lens[i];
@@ -1410,6 +1520,7 @@ void Inkling2::enc_forward(Encoder& e, Seq& s, int pos0, int T, bool dump_logits
 
     // Q/K/R clipping + V norm + log scaling + KV cache write
     const uint32_t kv_cap = L.is_swa ? uint32_t(ring_rows_) : uint32_t(s.cap);
+    const uint32_t kv_fp8_flag = use_kv_fp8_ ? 1u : 0u;
     {
       const Ink2QkvrP qp{uint32_t(T),
                          uint32_t(cfg_.hq),
@@ -1424,7 +1535,8 @@ void Inkling2::enc_forward(Encoder& e, Seq& s, int pos0, int T, bool dump_logits
                          cfg_.rel_clip,
                          cfg_.rms_eps,
                          cfg_.log_floor,
-                         cfg_.log_alpha};
+                         cfg_.log_alpha,
+                         kv_fp8_flag};
       e.use(ink2_pipe("ink2_qkvr_prep"));
       e.buf(0, q_);
       e.buf(1, k_);
@@ -1476,7 +1588,8 @@ void Inkling2::enc_forward(Encoder& e, Seq& s, int pos0, int T, bool dump_logits
                              uint32_t(cfg_.swa),
                              chunk,
                              nchunks,
-                             attn_scale};
+                             attn_scale,
+                             kv_fp8_flag};
       if (nchunks == 1u) {
         e.use(ink2_pipe("ink2_attn_decode_1pass"));
         e.buf(0, q_);
@@ -1527,7 +1640,8 @@ void Inkling2::enc_forward(Encoder& e, Seq& s, int pos0, int T, bool dump_logits
                              uint32_t(cfg_.swa),
                              chunk,
                              nchunks,
-                             attn_scale};
+                             attn_scale,
+                             kv_fp8_flag};
       e.use(ink2_pipe(T == 2 ? "ink2_attn_verify2" : "ink2_attn_verify"));
       e.buf(0, q_);
       e.buf(1, s.kc[v_idx]);
@@ -1558,7 +1672,8 @@ void Inkling2::enc_forward(Encoder& e, Seq& s, int pos0, int T, bool dump_logits
                             uint32_t(cfg_.rel_extent),
                             L.is_swa ? 1u : 0u,
                             uint32_t(cfg_.swa),
-                            attn_scale};
+                            attn_scale,
+                            kv_fp8_flag};
       const bool attn_t = use_tensor_ && T >= 32 && cfg_.head_dim == 128;
       e.use(attn_t ? ink2_tpipe("ink2_attn_prefill_t") : ink2_pipe("ink2_attn_prefill"));
       e.buf(0, q_);
@@ -1574,7 +1689,8 @@ void Inkling2::enc_forward(Encoder& e, Seq& s, int pos0, int T, bool dump_logits
     }
 
     // wo_ud + attn_sconv (+ *cur_x residual on non-boundary layers -> ffn_inp_)
-    enc_mm(e, *L.wo_ud, att_out_, a_out_, T);
+    if (L.wo_q && T <= 8) enc_q8_mv(e, L.wo_q, L.wo_s, H, QD, att_out_, a_out_, T);
+    else enc_mm(e, *L.wo_ud, att_out_, a_out_, T);
     const bool is_boundary = (ip % cfg_.block_sz == 0);
     if (T >= 16 && !save_conv_snaps) {
       const Ink2SconvStaticP asp{uint32_t(T), H, L.attn_sconv->dtype == DType::F32 ? 1u : 0u, 0u, 0u,
@@ -2073,8 +2189,9 @@ int Inkling2::debug_tensor_unit_check() {
   fails += check_moe("moe_mxfp8_t", layers_[20]);
   // 4. Attention Prefill (T=96, SWA)
   {
-    auto seq = new_seq(512, 512);
     const uint32_t QD = uint32_t(cfg_.hq) * uint32_t(cfg_.head_dim), KVD = uint32_t(cfg_.hkv) * uint32_t(cfg_.head_dim);
+    Buffer k_fp16 = g.alloc(size_t(ring_rows_) * KVD * 2, "ink2_chk_k");
+    Buffer v_fp16 = g.alloc(size_t(ring_rows_) * KVD * 2, "ink2_chk_v");
     for (uint32_t i = 0; i < T * QD; ++i) {
       q_.as<float>()[i] = 0.2f * std::sin(float(i) * 0.017f);
       gate_attn_.as<float>()[i] = 0.5f * std::cos(float(i) * 0.011f);
@@ -2084,21 +2201,23 @@ int Inkling2::debug_tensor_unit_check() {
       rb_.as<float>()[i] = 0.05f * std::sin(float(i) * 0.007f);
     for (uint32_t i = 0; i < T * KVD; ++i) {
       __fp16 kv = __fp16(0.2f * std::cos(float(i) * 0.019f)), vv = __fp16(0.2f * std::sin(float(i) * 0.023f));
-      std::memcpy(seq->kc[0].as<uint16_t>() + i, &kv, 2);
-      std::memcpy(seq->vc[0].as<uint16_t>() + i, &vv, 2);
+      std::memcpy(k_fp16.as<uint16_t>() + i, &kv, 2);
+      std::memcpy(v_fp16.as<uint16_t>() + i, &vv, 2);
     }
     const Ink2AttnPfP apf{T, 0u, uint32_t(ring_rows_), uint32_t(cfg_.hq), uint32_t(cfg_.hkv), uint32_t(cfg_.head_dim),
-                          uint32_t(cfg_.rel_extent), 1u, uint32_t(cfg_.swa), 1.0f / std::sqrt(float(cfg_.head_dim))};
+                          uint32_t(cfg_.rel_extent), 1u, uint32_t(cfg_.swa), 1.0f / std::sqrt(float(cfg_.head_dim)), 0u};
     std::vector<float> ref(T * QD), ten(T * QD);
     for (int arm = 0; arm < 2; ++arm) {
       auto e = g.begin();
       e->use(arm ? ink2_tpipe("ink2_attn_prefill_t") : ink2_pipe("ink2_attn_prefill"));
-      e->buf(0, q_); e->buf(1, seq->kc[0]); e->buf(2, seq->vc[0]); e->buf(3, rb_);
+      e->buf(0, q_); e->buf(1, k_fp16); e->buf(2, v_fp16); e->buf(3, rb_);
       e->buf(4, sinks_); e->buf(5, gate_attn_); e->buf(6, att_out_); e->val(7, apf);
       e->dispatch(arm ? (T + 15) / 16 : uint32_t(cfg_.hq), arm ? uint32_t(cfg_.hq) : T, 1, 128);
       e->commit_and_wait();
       (arm ? ten : ref).assign(att_out_.as<float>(), att_out_.as<float>() + T * QD);
     }
+    g.release(k_fp16);
+    g.release(v_fp16);
     fails += cmp("attn_prefill_t", ten.data(), ref.data(), T * QD, 0.2f);
   }
   // 5. Batched Cross-Pass MessageGate

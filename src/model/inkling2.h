@@ -80,6 +80,8 @@ struct Ink2Layer {
   const Tensor *w13 = nullptr, *w13_sc = nullptr, *w2 = nullptr, *w2_sc = nullptr;
   Buffer w13_outer, w2_outer;  // FP32 [128] = amax[e] / outer_scale_denominator[0] (NVFP4 only)
   Buffer qkvrsg_w;             // Fused BF16 [wq_du; wr_du; attn_sink_proj; gate_attn; wk_dv; wv_dv]
+  Buffer qkvrsg_q, qkvrsg_s;   // Q8_0 weights & scales (fast profile T <= 8)
+  Buffer wo_q, wo_s;           // Q8_0 wo_ud weights & scales (fast profile T <= 8)
   uint32_t qkvrsg_offs[7] = {};
   uint32_t qkvrsg_lens[6] = {};
 };
@@ -142,10 +144,13 @@ class Inkling2 : public Model {
   void alloc_buffers();
   bool ensure_rings(Seq& s);
   bool is_swa_slot(size_t slot) const;
+  size_t kv_elem_bytes(size_t slot) const { return (use_kv_fp8_ && slot < cfg_.schedule.size()) ? 1u : 2u; }
   void enc_forward(Encoder& e, Seq& s, int pos0, int T, bool dump_logits, const Buffer* out_logits, bool need_all_logits,
                    const Buffer* diag_rows = nullptr, bool capture_taps = false, bool save_conv_snaps = false);
   void enc_mm(Encoder& e, const Tensor& w, const Buffer& x, const Buffer& y, int M, uint32_t N_limit = 0, bool add = false,
               bool exact_f32 = false);
+  void enc_q8_mv(Encoder& e, const Buffer& wq, const Buffer& ws, uint32_t N, uint32_t K, const Buffer& x,
+                 const Buffer& y, int M, bool add = false);
   void enc_unembed(Encoder& e, const Buffer& x, const Buffer& y, int M, bool apply_softcap);
   void enc_norm(Encoder& e, const Buffer& x, const Tensor* w, const Buffer& out, int T, uint32_t dim);
   void enc_attn_res(Encoder& e, const Buffer* const* states, int M, const void* query_ptr, bool q_f32, uint32_t Q,
@@ -171,6 +176,10 @@ class Inkling2 : public Model {
   int ring_rows_ = 0;
   size_t mem_budget_ = 0;
   bool use_tensor_ = false;
+  bool use_q8_dense_ = false;
+  bool use_q8_head_ = false;
+  bool use_kv_fp8_ = false;
+  Buffer unembed_q_, unembed_s_;
 
   // Reusable activations sized for `tmax_` rows
   Buffer x_, x_pre_, inp_sa_, ffn_inp_, h_norm_;
