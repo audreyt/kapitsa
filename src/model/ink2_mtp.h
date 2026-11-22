@@ -37,6 +37,7 @@ struct Ink2MtpLayer {
   const Tensor *k_proj_ctx = nullptr, *v_proj_ctx = nullptr;
   const Tensor *gate_proj = nullptr, *up_proj = nullptr, *down_proj = nullptr;
   Buffer qkv_w, gate_up_w;
+  Buffer qkv_q, qkv_s, o_q, o_s, gu_q, gu_s, down_q, down_s;
   uint32_t qkv_offs[4] = {};
 };
 
@@ -76,8 +77,11 @@ class Ink2Mtp {
              const SamplingParams& sp, uint32_t step) const;
 
  private:
+  enum class WeightMode { Bf16, Q8, Q4 };
   void enc_mv(Encoder& e, const Tensor& w, const Buffer& x, const Buffer& y, int M, const Tensor* bias = nullptr,
               const Buffer* f32_bias = nullptr, uint32_t n_limit = 0, bool add = false, float softcap = 0.0f) const;
+  void enc_mv_q(Encoder& e, const Buffer& wq, const Buffer& ws, uint32_t N, uint32_t K, const Buffer& x,
+                const Buffer& y, int M, bool add = false) const;
   void enc_rmsnorm(Encoder& e, const Buffer& x, const Tensor& w, const Buffer& out, int T) const;
 
   Inkling2& trunk_;
@@ -85,6 +89,8 @@ class Ink2Mtp {
   int vocab_ = 0;
   int tmax_ = 512;
   int ring_rows_ = 0;
+  WeightMode w_mode_ = WeightMode::Q4;
+  bool screen_on_ = true;
   float fuse_w_[4][4] = {};
 
   WeightStore ws_;
@@ -96,8 +102,10 @@ class Ink2Mtp {
 
   std::vector<Buffer> owned_bufs_;
   Buffer fold_w_, fold_q_, fold_s_, fold_b_;  // Pre-folded BF16/Q8_0 [V, rank] + F32 [V]
+  Buffer unembed_p2_q_, unembed_p2_s_, fold_p2_q_, fold_p2_s_, base_proxy_;
   Buffer ctx_h_, ctx_k_, ctx_v_;
   Buffer blk_x_, blk_res_, blk_norm_, blk_q_, blk_k_, blk_v_, blk_att_, blk_gate_, blk_up_, blk_out_;
+  Buffer part_m_, part_l_, part_o_;
   Buffer state_, latent_, rnn_in_, rnn_gates_;
   Buffer draft_logits_, d_cand_v_, d_cand_i_, d_sprob_;
 };

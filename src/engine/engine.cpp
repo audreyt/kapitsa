@@ -4785,10 +4785,18 @@ ChatResult Engine::chat(const ChatRequest& r_in, const std::function<bool(const 
     req_cycles = 0;
     int pend_p0 = 0;
     int pend_m = 0;
-    int k_cur = ink2_spec_auto_ ? std::min(3, ink2_spec_) : ink2_spec_;
-    int full_streak = 0;
-    float wins_ema = 2.0f;
-    float trials_ema = 3.2f;
+    static const bool suffix_on = [] {
+      const char* v = getenv("NI_INK2_SUFFIX_DRAFT");
+      return !(v && *v && atoi(v) == 0);
+    }();
+    // Online 2-param cost model + per-depth accept EMAs + nmin=5 suffix lookup.
+    float step_ms = 17.3f;
+    float draft_ms = 2.4f;
+    float row_ms = 7.8f;
+    float p_depth[7] = {0.74f, 0.56f, 0.42f, 0.30f, 0.22f, 0.16f, 0.12f};
+    float lookup_e[7] = {1.50f, 2.00f, 2.50f, 3.00f, 3.50f, 4.00f, 4.50f};
+    int plain_streak = 0;
+    std::vector<int> suf_drafts;
     auto flush_pending = [&] {
       if (pend_m <= 0) return;
       auto ec = g.begin_grouped();
@@ -4804,7 +4812,79 @@ ChatResult Engine::chat(const ChatRequest& r_in, const std::function<bool(const 
         res.context_full = true;
         break;
       }
-      int K = std::min(k_cur, s.limit - P - 2);
+      const int avail_k = std::min(ink2_spec_, s.limit - P - 2);
+      int K = avail_k;
+      float best_rate = 0.0f;
+      if (ink2_spec_auto_) {
+        const bool force_probe = (plain_streak >= 12);
+        const float rate_0 = 1.0f / std::max(0.5f, step_ms);
+        int best_k = 1;
+        float best_dspark_rate = -1.0f;
+        float prob = 1.0f, exp_m = 1.0f;
+        for (int kc = 1; kc <= avail_k; ++kc) {
+          prob *= p_depth[kc - 1];
+          exp_m += prob;
+          const float pred_ms = std::max(1.0f, step_ms + draft_ms + row_ms * float(kc));
+          const float rate = exp_m / pred_ms;
+          if (rate > best_dspark_rate) {
+            best_dspark_rate = rate;
+            best_k = kc;
+          }
+        }
+        K = (!force_probe && best_dspark_rate < rate_0 * 0.96f) ? 0 : best_k;
+        best_rate = std::max(rate_0, best_dspark_rate);
+      } else {
+        float prob = 1.0f, exp_m = 1.0f;
+        for (int kc = 1; kc <= avail_k; ++kc) {
+          prob *= p_depth[kc - 1];
+          exp_m += prob;
+        }
+        best_rate = exp_m / std::max(1.0f, step_ms + draft_ms + row_ms * float(avail_k));
+      }
+
+      bool use_suffix = false;
+      if (suffix_on && sp.temperature <= 0.0f) {
+        ngram_drafts(s.tokens(), P, std::min(avail_k, 5), suf_drafts, 6, 5);
+        if (!suf_drafts.empty()) {
+          const int lk = std::clamp(int(suf_drafts.size()), 1, avail_k);
+          const float suf_rate = lookup_e[lk - 1] / std::max(1.0f, step_ms + row_ms * float(lk));
+          if (suf_rate > best_rate * 1.03f) {
+            use_suffix = true;
+            K = lk;
+          }
+        }
+      }
+
+      if (!use_suffix && K == 0) {
+        if (P + 2 > s.cap) {
+          flush_pending();
+          if (!grow_kv(std::min(s.limit, P + 2), [] {}) || P + 2 > s.cap) {
+            finish = "length";
+            res.context_full = true;
+            break;
+          }
+        }
+        const double t_cyc0 = now_ms();
+        auto e2 = g.begin_grouped();
+        if (pend_m > 0) {
+          ink2_->encode_mtp_commit(*e2, s, pend_p0, pend_m);
+          pend_m = 0;
+        }
+        ink2_->encode_step(*e2, s, P, sp, uint32_t(P), true);
+        e2->commit_and_wait();
+        const float cyc_ms = float(now_ms() - t_cyc0);
+        if (cyc_ms > 0.1f && cyc_ms < 500.0f) step_ms = 0.92f * step_ms + 0.08f * cyc_ms;
+        ++plain_streak;
+        go = handle(s.tokens()[P + 1]);
+        ++spec_cycles_;
+        ++req_cycles;
+        spec_accepted_ += 1;
+        cycle_done(1);
+        P += 1;
+        if (go && contended()) yield_turn(res);
+        continue;
+      }
+
       if (P + K + 2 > s.cap) {
         flush_pending();
         if (!grow_kv(std::min(s.limit, P + K + 2), [] {}) || P + 3 > s.cap) {
@@ -4812,41 +4892,36 @@ ChatResult Engine::chat(const ChatRequest& r_in, const std::function<bool(const 
           res.context_full = true;
           break;
         }
-        K = std::min(k_cur, s.cap - P - 2);
+        K = std::min(K, s.cap - P - 2);
       }
+      if (use_suffix) {
+        int* tk = s.tokens();
+        for (int i = 0; i < K; ++i) tk[P + 1 + i] = suf_drafts[size_t(i)];
+      }
+      const double t_cyc0 = now_ms();
       auto e2 = g.begin_grouped();
       if (pend_m > 0) {
         ink2_->encode_mtp_commit(*e2, s, pend_p0, pend_m);
         pend_m = 0;
       }
-      ink2_->encode_mtp_draft(*e2, s, P, K, sp, uint32_t(P));
+      if (!use_suffix) ink2_->encode_mtp_draft(*e2, s, P, K, sp, uint32_t(P));
       ink2_->encode_mtp_verify(*e2, s, P, K + 1, sp, uint32_t(P));
       e2->commit_and_wait();
+      const float cyc_ms = float(now_ms() - t_cyc0);
       const int a = ink2_->accept_mtp(s, P, K, sp, uint32_t(P));
-      if (ink2_spec_auto_ && K == k_cur) {
-        wins_ema = 0.7f * wins_ema + float(a);
-        trials_ema = 0.7f * trials_ema + float(std::min(a + 1, K));
-        if (a == K) {
-          ++full_streak;
-          k_cur = std::min(ink2_spec_, k_cur + (full_streak >= 2 ? 2 : 1));
-        } else {
-          full_streak = 0;
-          const float p_hat = std::clamp(wins_ema / std::max(1.0f, trials_ema), 0.1f, 0.99f);
-          constexpr float c_rel = 0.42f;
-          int best_k = 1;
-          float best_rate = -1.0f;
-          float pk = p_hat;
-          float expect_m = 1.0f;
-          for (int kc = 1; kc <= ink2_spec_; ++kc) {
-            expect_m += pk;
-            pk *= p_hat;
-            const float rate = expect_m / (1.0f + c_rel * float(kc));
-            if (rate > best_rate) {
-              best_rate = rate;
-              best_k = kc;
-            }
-          }
-          k_cur = best_k;
+      if (cyc_ms > 0.1f && cyc_ms < 500.0f && K >= 1) {
+        const float obs_row = std::clamp((cyc_ms - (use_suffix ? 0.0f : draft_ms) - step_ms) / float(K), 1.0f, 30.0f);
+        row_ms = 0.92f * row_ms + 0.08f * obs_row;
+      }
+      plain_streak = 0;
+      if (use_suffix) {
+        const int lb = std::clamp(K, 1, 7) - 1;
+        lookup_e[lb] = 0.80f * lookup_e[lb] + 0.20f * float(a + 1);
+      } else {
+        const int lim = std::min(a + 1, K);
+        for (int j = 0; j < lim && j < 7; ++j) {
+          const float hit = (j < a) ? 1.0f : 0.0f;
+          p_depth[j] = 0.92f * p_depth[j] + 0.08f * hit;
         }
       }
       const int* tk = s.tokens();

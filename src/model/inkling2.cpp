@@ -128,7 +128,7 @@ void prewarm_pipelines() {
       "ink2_attn_res",         "ink2_msg_gate",         "ink2_msg_gate_prep_s",  "ink2_msg_gate_down_s",
       "ink2_msg_gate_up_mix_s","ink2_msg_gate_up_mix_norm_s",
       "ink2_embed_norm",       "ink2_sconv_static",      "ink2_sconv_static_pf",  "ink2_sconv_dynamic",    "ink2_qkvr_prep",         "ink2_rel_bias",         "ink2_rel_bias_pf",
-      "ink2_attn_decode",      "ink2_attn_decode_reduce","ink2_attn_decode_1pass","ink2_attn_verify",      "ink2_attn_verify_reduce","ink2_attn_prefill",     "ink2_moe_route",
+      "ink2_attn_decode",      "ink2_attn_decode_reduce","ink2_attn_decode_1pass","ink2_attn_verify",      "ink2_attn_verify2",     "ink2_attn_verify_reduce","ink2_attn_prefill",     "ink2_moe_route",
       "ink2_moe_nvfp4_w13_situ","ink2_moe_nvfp4_w2_acc", "ink2_moe_mxfp8_w13_situ","ink2_moe_mxfp8_w2_acc",
       "ink2_moe_bucket_small", "ink2_moe_nvfp4_w13_g",   "ink2_moe_nvfp4_w2_g",   "ink2_moe_mxfp8_w13_g",
       "ink2_moe_mxfp8_w2_g",   "ink2_moe_reduce8_m3",    "ink2_mtp_argmax_stage1","ink2_mtp_argmax_stage2",
@@ -1528,7 +1528,7 @@ void Inkling2::enc_forward(Encoder& e, Seq& s, int pos0, int T, bool dump_logits
                              chunk,
                              nchunks,
                              attn_scale};
-      e.use(ink2_pipe("ink2_attn_verify"));
+      e.use(ink2_pipe(T == 2 ? "ink2_attn_verify2" : "ink2_attn_verify"));
       e.buf(0, q_);
       e.buf(1, s.kc[v_idx]);
       e.buf(2, s.vc[v_idx]);
@@ -1680,7 +1680,7 @@ void Inkling2::enc_forward(Encoder& e, Seq& s, int pos0, int T, bool dump_logits
         e.buf(1, moe_out_);
         e.val(2, mp);
         e.dispatch(((H / 4) + 63) / 64, uint32_t(T), 1, 64);
-      } else if (T >= 2 && T <= 8 && moe_tiles_) {
+      } else if (T >= 3 && T <= 8 && moe_tiles_) {
         const struct {
           uint32_t T, K_top, E;
         } bp{uint32_t(T), uint32_t(cfg_.top_k), uint32_t(cfg_.n_experts)};
