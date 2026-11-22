@@ -1,6 +1,7 @@
 #include "model/ink2_dflare.h"
 
 #include "model/inkling2_kernels.h"
+#include "kernels/kflash.h"
 #include "model/kparams.h"
 #include "model/nemotron_h.h"
 #include "model/sampler.h"
@@ -86,6 +87,10 @@ struct DflP2ScreenP { uint32_t V, R, has_sup, sup_words; };
 struct DflRescoreP { uint32_t V, H, R, u_f32, has_sup, sup_words; };
 struct DflArgmaxP { uint32_t tok_out_idx; };
 struct DflAccP { uint32_t pos, K; };
+struct DflBeamPrepP { uint32_t rank, H, V, first_step; };
+struct DflRescoreBeamP { uint32_t V, H, R, u_f32, has_sup, sup_words; float softcap, inv_cap; };
+struct DflBeamStepP { uint32_t V, R, d, R_budget, last_step; float inv_t; };
+struct DflTreeSelP { uint32_t R_budget, pos; };
 
 constexpr int kCommitBatch = 64;
 constexpr uint32_t kShortlistK = 128;
@@ -126,10 +131,13 @@ Ink2DFlare::Ink2DFlare(Inkling2& target, const std::string& dir) : tg_(target), 
         "dflare_attn", "dflare_markov_concat", "dflare_markov_gru", "dflare_fold_mm_q8",
         "dflare_quant_q8_bf16", "dflare_quant_p2_w", "dflare_q8_mv8", "dflare_q8_mv8_multi3",
         "dflare_q8_gate_up_swiglu8", "dflare_p2_unembed_base", "dflare_p2_fold_screen", "dflare_rescore_exact",
-        "dflare_argmax_128", "dflare_accept_samples",
+        "dflare_argmax_128", "dflare_accept_samples", "dflare_beam_init", "dflare_beam_concat",
+        "dflare_beam_gru", "dflare_p2_fold_screen_beam", "dflare_rescore_beam", "dflare_beam_step",
+        "dflare_tree_select", "dflare_accept_tree_samples",
     };
     for (const char* k : kDflNames) (void)dfl_pipe(k);
-    for (const char* k : {"topk_stage1_rows_sg", "sample_stage2_rows", "sample_full"}) (void)Gpu::get().pipeline(k);
+    for (const char* k : {"topk_stage1_rows_sg", "sample_stage2_rows", "sample_stage2_rows_tree", "sample_full"})
+      (void)Gpu::get().pipeline(k);
   }
   load();
   alloc_buffers();
@@ -368,6 +376,20 @@ void Ink2DFlare::alloc_buffers() {
   for (int i = 0; i < Inkling2::kMaxVerify; ++i) acc_dstep_.as<int>()[i] = i;
   accept_out_ = alloc(16u, "dfl_accept_out");
   memset(accept_out_.ptr(), 0, accept_out_.size);
+
+  beam_state_ = alloc(4u * size_t(rank_) * 4u, "dfl_b_state");
+  beam_next_state_ = alloc(4u * size_t(rank_) * 4u, "dfl_b_nstate");
+  beam_latent_ = alloc(4u * size_t(rank_) * 4u, "dfl_b_lat");
+  beam_rnn_in_ = alloc(4u * (2u * size_t(rank_) + 2u * size_t(H_)) * 4u, "dfl_b_rin");
+  beam_cand_v_ = alloc(4u * 128u * 4u, "dfl_b_cv");
+  beam_cand_i_ = alloc(4u * 128u * 4u, "dfl_b_ci");
+  beam_meta_ = alloc(64u, "dfl_b_meta");
+  cand_pool_ = alloc(128u * 16u, "dfl_b_cpool");
+  tree_buf_ = alloc(512u, "dfl_tree");
+  kf_tree_ = alloc(size_t(kf::kWords) * 4u, "dfl_kf_tree");
+  memset(kf_tree_.ptr(), 0, kf_tree_.size);
+  tree_accept_out_ = alloc(sizeof(Ink2TreeAccept), "dfl_tree_acc");
+  memset(tree_accept_out_.ptr(), 0, tree_accept_out_.size);
 }
 
 std::unique_ptr<Ink2DFlareSeq> Ink2DFlare::new_seq() {
@@ -477,10 +499,10 @@ void Ink2DFlare::encode_commit(Encoder& e, Ink2DFlareSeq& ds, const Buffer& taps
   ds.ctx_len = std::min(ctx_cap_, ds.ctx_len + n_rows);
 }
 
-void Ink2DFlare::encode_draft(Encoder& e, Seq& s, Ink2DFlareSeq& ds, int pos, int depth) {
+void Ink2DFlare::encode_backbone_and_base(Encoder& e, Seq& s, Ink2DFlareSeq& ds, int pos, int depth) {
   if (depth < 1 || depth > kMaxDrafts) fatal("ink2_dflare: depth %d out of range", depth);
   const int B = depth + 1;
-  const uint32_t H = uint32_t(H_), R = uint32_t(rank_), V = uint32_t(tg_.vocab());
+  const uint32_t H = uint32_t(H_), V = uint32_t(tg_.vocab());
   const float scale = 1.0f / std::sqrt(float(D_));
   const uint32_t ctx_len = uint32_t(std::min(ds.ctx_len, std::min(pos, ctx_cap_)));
 
@@ -526,6 +548,11 @@ void Ink2DFlare::encode_draft(Encoder& e, Seq& s, Ink2DFlareSeq& ds, int pos, in
   // 4. 2-bit proxy unembed base screening [depth, V] fp16
   run_k(e, "dflare_p2_unembed_base", {draft_h_, unembed_p2_q_, unembed_p2_s_, fold_b_, base_proxy_},
         DflP2BaseP{uint32_t(depth), V, H, H / 32u}, (V + 15u) / 16u, 1u, 128u);
+}
+
+void Ink2DFlare::encode_draft(Encoder& e, Seq& s, Ink2DFlareSeq& ds, int pos, int depth) {
+  encode_backbone_and_base(e, s, ds, pos, depth);
+  const uint32_t H = uint32_t(H_), R = uint32_t(rank_), V = uint32_t(tg_.vocab());
 
   // 5. Left-to-right RNN Markov head: 2-bit full-vocab screen -> exact top-128 rescore -> argmax
   const uint32_t rnn_in_dim = 2u * R + 2u * H, has_sup = s.suppression ? 1u : 0u;
@@ -546,6 +573,68 @@ void Ink2DFlare::encode_draft(Encoder& e, Seq& s, Ink2DFlareSeq& ds, int pos, in
           DflRescoreP{V, H, R, u_f32, has_sup, sup_words}, 32u, 1u, 128u);
     run_k(e, "dflare_argmax_128", {pick_v_, pick_i_, s.tok}, DflArgmaxP{uint32_t(pos + step + 1)}, 1u, 1u, 128u);
   }
+}
+
+void Ink2DFlare::encode_draft_tree(Encoder& e, Seq& s, Ink2DFlareSeq& ds, int pos, int R_budget,
+                                   const SamplingParams& sp) {
+  const int R_b = std::clamp(R_budget, 2, Inkling2::kMaxVerify);
+  const int D_max = std::min(max_drafts(), R_b - 1);
+  encode_backbone_and_base(e, s, ds, pos, D_max);
+  const uint32_t H = uint32_t(H_), R = uint32_t(rank_), V = uint32_t(tg_.vocab()), tot_in = 2u * R + 2u * H;
+  run_k(e, "dflare_beam_init", {s.tok, beam_meta_, cand_pool_}, uint32_t(pos), 1u, 1u, 32u);
+
+  const float t_beam = sp.temperature > 0.0f ? std::clamp(sp.temperature, 0.25f, 2.0f) : 1.0f;
+  const float inv_t = 1.0f / t_beam, softcap = tg_.config().logit_softcap, inv_sc = softcap > 0.0f ? 1.0f / softcap : 0.0f;
+  const uint32_t has_sup = s.suppression ? 1u : 0u, sup_words = has_sup ? uint32_t(s.suppression->words) : 0u;
+  const uint32_t u_f32 = tg_.unembed_tensor().dtype == DType::F32 ? 1u : 0u;
+  const Buffer& sup_buf = has_sup ? s.suppression->mask : fold_b_;
+
+  for (int d = 0; d < D_max; ++d) {
+    const uint32_t active_b = (d == 0) ? 1u : uint32_t(std::min(4, R_b - 1));
+    const Buffer h_row = draft_h_.view(size_t(d) * H * 4u, size_t(H) * 4u);
+    const DflBeamPrepP bp{R, H, V, d == 0 ? 1u : 0u};
+    run_k(e, "dflare_beam_concat", {beam_meta_, beam_state_, mh_w1_, h_row, ds.rows_f, beam_rnn_in_}, bp,
+          (tot_in + 255u) / 256u, active_b, 256u);
+    run_k(e, "dflare_beam_gru", {beam_meta_, beam_rnn_in_, mh_rnn_w_, mh_rnn_b_, beam_state_, beam_next_state_, beam_latent_},
+          bp, (R + 3u) / 4u, 1u, 128u);
+    run_k(e, "dflare_p2_fold_screen_beam",
+          {beam_meta_, beam_latent_, fold_p2_q_, fold_p2_s_, base_proxy_.view(size_t(d) * V * 2u, size_t(V) * 2u), sup_buf,
+           beam_cand_v_, beam_cand_i_},
+          DflP2ScreenP{V, R, has_sup, sup_words}, 64u, 1u, 256u);
+    run_k(e, "dflare_rescore_beam",
+          {beam_meta_, h_row, beam_latent_, tg_.unembed_tensor().buf, fold_q_, fold_s_, fold_b_, sup_buf, beam_cand_i_,
+           beam_cand_v_},
+          DflRescoreBeamP{V, H, R, u_f32, has_sup, sup_words, softcap, inv_sc}, 32u, active_b, 128u);
+    run_k(e, "dflare_beam_step", {beam_meta_, cand_pool_, beam_cand_v_, beam_cand_i_, beam_next_state_, beam_state_},
+          DflBeamStepP{V, R, uint32_t(d), uint32_t(R_b), (d + 1 == D_max) ? 1u : 0u, inv_t}, 1u, 1u, 128u);
+  }
+  run_k(e, "dflare_tree_select", {beam_meta_, cand_pool_, tree_buf_, kf_tree_, s.tok},
+        DflTreeSelP{uint32_t(R_b), uint32_t(pos)}, 1u, 1u, 128u);
+}
+
+void Ink2DFlare::encode_accept_tree(Encoder& e, Seq& s, int pos, int R_budget, const Buffer& verify_logits,
+                                    const SamplingParams& sp) {
+  const uint32_t V = uint32_t(tg_.vocab());
+  if (full_vocab(sp)) {
+    enc_sample_full_rows(e, verify_logits, V, R_budget, acc_samp_, 0, acc_sprob_, sp, uint32_t(pos), kf_tree_,
+                         size_t(kf::kDep) * 4u);
+  } else {
+    static const Pipeline p_tk = Gpu::get().pipeline("topk_stage1_rows_sg");
+    static const Pipeline p_s2 = Gpu::get().pipeline("sample_stage2_rows_tree");
+    const uint32_t K = topk_k(sp), chunk = topk_chunk(K), lists = topk_lists(V, K);
+    e.use(p_tk);
+    e.buf(0, verify_logits); e.buf(1, acc_cv_); e.buf(2, acc_ci_);
+    e.val(3, kp::TopkStage{V, K, chunk});
+    e.dispatch(lists, uint32_t(R_budget), 1, topk_threads(K));
+
+    e.use(p_s2);
+    e.buf(0, acc_cv_); e.buf(1, acc_ci_); e.buf(2, acc_samp_);
+    e.val(3, kp::SampleRows{lists * K, K, sp.temperature, sp.top_p, sp.seed, uint32_t(pos), 0u, 0u, 0u, 0u});
+    e.buf(4, acc_dstep_);
+    e.buf(5, kf_tree_);
+    e.dispatch(uint32_t(R_budget), 1, 1, 1024);
+  }
+  run_k(e, "dflare_accept_tree_samples", {tree_buf_, acc_samp_, s.tok, tree_accept_out_}, uint32_t(pos), 1u, 1u, 32u);
 }
 
 void Ink2DFlare::encode_accept(Encoder& e, Seq& s, int pos, int depth, const Buffer& verify_logits,

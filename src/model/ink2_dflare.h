@@ -16,6 +16,10 @@ struct Ink2DFlareSeq {
   int ctx_len = 0;             // committed context positions in ring (clamped to ctx_cap)
 };
 
+struct Ink2TreeAccept {
+  int32_t m, stop_node, bonus_tok, path[8];
+};
+
 class Ink2DFlare {
  public:
   static constexpr int kMaxDrafts = 7;
@@ -47,6 +51,13 @@ class Ink2DFlare {
   void encode_accept(Encoder& e, Seq& s, int pos, int depth, const Buffer& verify_logits, const SamplingParams& sp);
   int accepted_count() const { return accept_out_.as<int>()[0]; }
 
+  // Bayes-Optimal W=4 On-GPU Markov Beam Tree drafting & lossless Zero-Logits-D2H tree accept
+  const Buffer& tree_buf() const { return tree_buf_; }
+  void encode_draft_tree(Encoder& e, Seq& s, Ink2DFlareSeq& ds, int pos, int R_budget, const SamplingParams& sp);
+  void encode_accept_tree(Encoder& e, Seq& s, int pos, int R_budget, const Buffer& verify_logits,
+                          const SamplingParams& sp);
+  Ink2TreeAccept tree_accept() const { return *tree_accept_out_.as<Ink2TreeAccept>(); }
+
  private:
   struct Q8Mat {
     Buffer q, s;
@@ -65,6 +76,7 @@ class Ink2DFlare {
   void enc_q8(Encoder& e, const Q8Mat& w, const Buffer& x, const Buffer& y, int M, bool add = false);
   void enc_q8_mv(Encoder& e, const Q8Mat& w, const Buffer& x, const Buffer& y, int M, bool add = false);
   void enc_rmsnorm(Encoder& e, const Buffer& x, const Buffer& w, const Buffer& out, int T);
+  void encode_backbone_and_base(Encoder& e, Seq& s, Ink2DFlareSeq& ds, int pos, int depth);
 
   Inkling2& tg_;
   std::string dir_;
@@ -88,6 +100,8 @@ class Ink2DFlare {
   Buffer base_proxy_, pick_v_, pick_i_;          // 2-bit screening [depth, V] fp16 + top-128 shortlist
   Buffer mh_state_, mh_rnn_in_, mh_latent_;
   Buffer acc_cv_, acc_ci_, acc_samp_, acc_sprob_, acc_dstep_, accept_out_;
+  Buffer beam_state_, beam_next_state_, beam_latent_, beam_rnn_in_;
+  Buffer beam_cand_v_, beam_cand_i_, beam_meta_, cand_pool_, tree_buf_, kf_tree_, tree_accept_out_;
 };
 
 }  // namespace ni

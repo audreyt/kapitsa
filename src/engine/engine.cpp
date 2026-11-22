@@ -662,6 +662,7 @@ Engine::Engine(const EngineOptions& o) : opts_(o) {
       const size_t pf_rows = size_t(prefill_chunk_room(opts_.prefill_chunk));
       ink2_pf_taps_ = g.alloc(4 * pf_rows * H * 4, "ink2_pf_taps");
       ink2_vf_taps_ = g.alloc(4 * size_t(Inkling2::kMaxVerify) * H * 4, "ink2_vf_taps");
+      ink2_vf_taps_gather_ = g.alloc(4 * size_t(Inkling2::kMaxVerify) * H * 4, "ink2_vf_taps_g");
       ink2_vf_logits_ = g.alloc(size_t(Inkling2::kMaxVerify) * V * 4, "ink2_vf_logits");
     }
   }
@@ -993,7 +994,7 @@ MemPlan model_plan(const std::string& model_dir, int prefill_chunk) {
     const Ink2Config ic = Inkling2::read_config(model_dir);
     const size_t pf_rows = size_t(prefill_chunk_room(prefill_chunk > 0 ? prefill_chunk : 512));
     p.mtp += 620ull * 1024ull * 1024ull;  // ~0.60 GB Q8 DFlare drafter + folded head + 2-bit proxies
-    p.activations += 4 * (pf_rows + size_t(Inkling2::kMaxVerify)) * size_t(ic.hidden) * 4 +
+    p.activations += 4 * (pf_rows + 2 * size_t(Inkling2::kMaxVerify)) * size_t(ic.hidden) * 4 +
                      size_t(Inkling2::kMaxVerify) * size_t(ic.vocab) * 4;
     p.slot_state += 3ull * 2ull * 1023ull * 1024ull * 2ull;  // 3-layer DFlare context ring (12.6 MB/slot)
   }
@@ -4177,66 +4178,174 @@ ChatResult Engine::chat(const ChatRequest& r_in, const std::function<bool(const 
     fed_until = P;
   } else if (ink2_dfl_ && slot.ink2_dseq && !gm && !tc.on()) {
     // Inkling-2-Mini bundled DFlare/DSpark speculative decoding (mtp.safetensors):
-    // tokens[P] is the pending anchor token; each cycle fuses previous conv rollback + tap commit +
-    // DFlare block draft (depth d) + Inkling-2 parallel verify (d + 1 rows) + Zero-Logits-D2H GPU accept
-    // into one command buffer.
+    // tokens[P] is the pending anchor token; default auto mode uses W=4 Markov beam tree drafting + online UCB
+    // DraftPolicy; fixed --spec K uses linear chain drafting of depth K.
+    static const int tree_env = [] { const char* v = getenv("NI_INK2_TREE"); return (v && *v) ? atoi(v) : -1; }();
+    static const int tree_r_pin = [] { const char* v = getenv("NI_INK2_TREE_R"); return (v && *v) ? atoi(v) : 0; }();
+    const bool tree_enabled = (tree_env == 1 || (tree_env != 0 && (ink2_spec_auto_ || tree_r_pin >= 2)));
+
+    int chan = 0;
+    auto update_chan = [&](int tok_id) {
+      if (tok_id == 200008) chan = 0;
+      else if (tok_id == 200004) chan = 1;
+      else if (tok_id == 200024 || tok_id == 200049) chan = 2;
+    };
+    for (int pi = 0; pi <= n; ++pi) update_chan(s.tokens()[pi]);
+
+    const float ctx_k = float(std::min(n, 16384)) / 1024.0f, ctx_scale = 1.0f + 0.025f * ctx_k;
+    static constexpr int kTreeRs[5] = {2, 3, 4, 6, 8};
+    float step_ms = 25.6f + 0.25f * ctx_k;
+    bool step_ms_seen = false;
+    float tree_ms[5] = {33.4f * ctx_scale, 41.5f * ctx_scale, 45.3f * ctx_scale, 59.5f * ctx_scale, 76.1f * ctx_scale};
+    float tree_yield[3][5];
+    const float priors_g[5] = {1.56f, 2.02f, 2.55f, 3.05f, 3.40f}, priors_t[5] = {1.52f, 1.94f, 2.40f, 2.82f, 3.12f};
+    const float* base_p = (sp.temperature <= 0.0f) ? priors_g : priors_t;
+    for (int i = 0; i < 5; ++i) {
+      tree_yield[0][i] = base_p[i];
+      tree_yield[1][i] = base_p[i];
+      tree_yield[2][i] = base_p[i] + 0.10f + 0.04f * float(i);
+    }
+    int tree_visits[3][5] = {}, tree_ms_visits[5] = {}, plain_streak = 0;
+    auto record_arm = [&](int idx, int c_id, int m_acc, float cyc_ms) {
+      if (idx < 0) return;
+      if (cyc_ms > 0.1f && cyc_ms < 500.0f) {
+        const float ratio = std::clamp(cyc_ms / std::max(1.0f, tree_ms[idx]), 0.35f, 3.0f);
+        const float lr_ms = tree_ms_visits[idx] < 4 ? 0.45f : 0.15f;
+        tree_ms[idx] = (1.0f - lr_ms) * tree_ms[idx] + lr_ms * cyc_ms;
+        ++tree_ms_visits[idx];
+        const float scale_u = 1.0f + lr_ms * (ratio - 1.0f);
+        for (int j = 0; j < 5; ++j)
+          if (tree_ms_visits[j] == 0) tree_ms[j] *= scale_u;
+        if (!step_ms_seen) step_ms *= scale_u;
+      }
+      const float lr_y = 1.0f / std::min(24.0f, 6.0f + float(tree_visits[c_id][idx]));
+      tree_yield[c_id][idx] = (1.0f - lr_y) * tree_yield[c_id][idx] + lr_y * float(m_acc);
+      ++tree_visits[c_id][idx];
+      const float gain = std::max(0.0f, tree_yield[c_id][idx] - 1.0f);
+      const float sat = gain / float(kTreeRs[idx] - 1);
+      const float exp_up = 0.45f + 0.35f * sat * sat;
+      for (int j = 0; j < 5; ++j) {
+        if (j == idx || tree_visits[c_id][j] > 0) continue;
+        const float rr = float(kTreeRs[j] - 1) / float(kTreeRs[idx] - 1);
+        const float pw = (j < idx) ? 0.75f : exp_up;
+        tree_yield[c_id][j] = std::min(float(kTreeRs[j]), 1.0f + gain * std::pow(rr, pw));
+      }
+    };
+
     int P = n;
     bool go = handle(s.tokens()[n]);
     int cur_d = ink2_spec_auto_ ? std::min(2, ink2_spec_) : ink2_spec_;
     int zero_streak = 0, plain_rem = 0;
-    int pending_commit = 0, pending_pos = 0, pending_stride = 0, pending_rb = -1;
-    // Flush pending rollback + tap commit before yielding the GPU turn, growing KV, or leaving the loop so another
-    // concurrent slot can never overwrite shared conv_snap_ / ink2_vf_taps_ buffers in between.
-    auto flush_pending = [&] {
-      if (pending_commit > 0) {
-        auto ef = g.begin();
-        ink2_->encode_conv_rollback(*ef, s, pending_rb, pending_stride);
-        ink2_dfl_->encode_commit(*ef, *slot.ink2_dseq, ink2_vf_taps_, pending_commit, pending_pos, pending_stride);
-        ef->commit_and_wait();
-        slot.ink2_dseq_pos = pending_pos + pending_commit;
-        pending_commit = 0;
+    int pending_commit = 0, pending_pos = 0, pending_stride = 0, pending_rb = -1, pending_path[8] = {};
+    bool pending_is_tree = false;
+
+    auto enc_pending = [&](Encoder& e) {
+      if (pending_commit <= 0) return;
+      if (pending_is_tree) {
+        const bool gath = ink2_->encode_tree_commit_state(e, s, pending_pos, pending_path, pending_commit,
+                                                          ink2_vf_taps_, ink2_vf_taps_gather_, pending_stride);
+        ink2_dfl_->encode_commit(e, *slot.ink2_dseq, gath ? ink2_vf_taps_gather_ : ink2_vf_taps_,
+                                 pending_commit, pending_pos, gath ? pending_commit : pending_stride);
+      } else {
+        ink2_->encode_conv_rollback(e, s, pending_rb, pending_stride);
+        ink2_dfl_->encode_commit(e, *slot.ink2_dseq, ink2_vf_taps_, pending_commit, pending_pos, pending_stride);
       }
+      slot.ink2_dseq_pos = pending_pos + pending_commit;
+      pending_commit = 0;
+      pending_is_tree = false;
     };
+    auto flush_pending = [&] {
+      if (pending_commit > 0) { auto ef = g.begin(); enc_pending(*ef); ef->commit_and_wait(); }
+    };
+
     while (go) {
-      const int need_rows = plain_rem > 0 ? 1 : (cur_d + 1);
+      const int avail_tree_r = std::min(Inkling2::kMaxVerify, s.limit - P - 2);
+      int R_tree = 0, best_tree_idx = -1;
+      bool use_tree = false, do_plain = (plain_rem > 0);
+      if (tree_enabled && avail_tree_r >= 2) {
+        const float rate_0 = 1.0f / std::max(0.5f, step_ms);
+        if (tree_r_pin >= 2) {
+          R_tree = std::min(tree_r_pin, avail_tree_r);
+          use_tree = true;
+        } else {
+          int best_i = 0; float best_ucb = -1.0f, best_true = -1.0f;
+          for (int i = 0; i < 5 && kTreeRs[i] <= avail_tree_r; ++i) {
+            const float tr = tree_yield[chan][i] / std::max(1.0f, tree_ms[i]);
+            const float ucb = 0.03f / std::sqrt(1.0f + float(tree_visits[chan][i]));
+            const float rt = tr + ucb / std::max(1.0f, tree_ms[i]);
+            if (rt > best_ucb) { best_ucb = rt; best_true = tr; best_i = i; }
+          }
+          const float cmp_r = (tree_visits[chan][best_i] >= 6) ? best_true : best_ucb;
+          if (!(plain_streak >= 16) && cmp_r < rate_0 * 0.98f) do_plain = true;
+          else { use_tree = true; best_tree_idx = best_i; R_tree = kTreeRs[best_i]; }
+        }
+      } else if (tree_enabled) {
+        do_plain = true;
+      }
+      const int need_rows = do_plain ? 1 : (use_tree ? R_tree : (cur_d + 1));
       if (P + need_rows + 1 >= s.cap) {
         flush_pending();
         if (P + need_rows + 1 >= s.limit || !grow_kv(std::min(s.limit, P + need_rows + 2), [] {})) {
-          finish = "length";
-          res.context_full = true;
-          break;
+          finish = "length"; res.context_full = true; break;
         }
       }
-      if (plain_rem > 0) {
-        // Adaptive plain-step backoff on high-entropy text: keep DFlare ring in sync while avoiding verify overhead.
+      if (do_plain) {
+        const double t_cyc0 = now_ms();
         auto e2 = g.begin();
-        if (pending_commit > 0) {
-          ink2_->encode_conv_rollback(*e2, s, pending_rb, pending_stride);
-          ink2_dfl_->encode_commit(*e2, *slot.ink2_dseq, ink2_vf_taps_, pending_commit, pending_pos, pending_stride);
-          slot.ink2_dseq_pos = pending_pos + pending_commit;
-          pending_commit = 0;
-        }
+        enc_pending(*e2);
         ink2_->encode_step_taps(*e2, s, P, sp, uint32_t(P), true, &ink2_vf_taps_);
         ink2_dfl_->encode_commit(*e2, *slot.ink2_dseq, ink2_vf_taps_, 1, P, 1);
         e2->commit_and_wait();
+        const float gpu_dt = float(e2->gpu_ms());
+        const float cyc_ms = (gpu_dt > 0.1f && gpu_dt < 500.0f) ? gpu_dt : float(now_ms() - t_cyc0);
+        if (tree_enabled && cyc_ms > 0.1f && cyc_ms < 500.0f) {
+          step_ms = step_ms_seen ? (0.85f * step_ms + 0.15f * cyc_ms) : cyc_ms;
+          step_ms_seen = true;
+        }
         slot.ink2_dseq_pos = P + 1;
+        update_chan(s.tokens()[P + 1]);
         if (!handle(s.tokens()[P + 1])) go = false;
         ++req_cycles;
         cycle_done(1);
         ++P;
-        --plain_rem;
+        if (plain_rem > 0) --plain_rem;
+        ++plain_streak;
         if (go && contended()) yield_turn(res);
+        continue;
+      }
+      if (use_tree) {
+        const double t_cyc0 = now_ms();
+        auto e2 = g.begin();
+        enc_pending(*e2);
+        ink2_dfl_->encode_draft_tree(*e2, s, *slot.ink2_dseq, P, R_tree, sp);
+        ink2_->encode_verify_tree(*e2, s, P, R_tree, ink2_dfl_->tree_buf(), ink2_vf_logits_, &ink2_vf_taps_);
+        ink2_dfl_->encode_accept_tree(*e2, s, P, R_tree, ink2_vf_logits_, sp);
+        e2->commit_and_wait();
+        const float gpu_dt = float(e2->gpu_ms());
+        const float cyc_ms = (gpu_dt > 0.1f && gpu_dt < 500.0f) ? gpu_dt : float(now_ms() - t_cyc0);
+        const Ink2TreeAccept acc = ink2_dfl_->tree_accept();
+        const int cur_chan = chan;
+        record_arm(best_tree_idx, cur_chan, acc.m, cyc_ms);
+        plain_streak = 0;
+        int* tk = s.tokens();
+        int m = 0;
+        while (m < acc.m) {
+          pending_path[m] = acc.path[m];
+          ++m;
+          update_chan(tk[P + m]);
+          if (!handle(tk[P + m])) { go = false; break; }
+        }
+        ++spec_cycles_; ++req_cycles; spec_accepted_ += (m - 1);
+        cycle_done(m);
+        pending_commit = m; pending_pos = P; pending_stride = R_tree; pending_is_tree = true;
+        P += m;
+        if (go && contended()) { flush_pending(); yield_turn(res); }
         continue;
       }
       const int d = cur_d;
       {
         auto e2 = g.begin();
-        if (pending_commit > 0) {
-          ink2_->encode_conv_rollback(*e2, s, pending_rb, pending_stride);
-          ink2_dfl_->encode_commit(*e2, *slot.ink2_dseq, ink2_vf_taps_, pending_commit, pending_pos, pending_stride);
-          slot.ink2_dseq_pos = pending_pos + pending_commit;
-          pending_commit = 0;
-        }
+        enc_pending(*e2);
         ink2_dfl_->encode_draft(*e2, s, *slot.ink2_dseq, P, d);
         ink2_->encode_verify(*e2, s, P, d + 1, ink2_vf_logits_, &ink2_vf_taps_, true);
         ink2_dfl_->encode_accept(*e2, s, P, d, ink2_vf_logits_, sp);
@@ -4247,38 +4356,22 @@ ChatResult Engine::chat(const ChatRequest& r_in, const std::function<bool(const 
       int m = 0;
       while (m < a + 1) {
         ++m;
-        if (!handle(tk[P + m])) {
-          go = false;
-          break;
-        }
+        if (!handle(tk[P + m])) { go = false; break; }
       }
-      ++spec_cycles_;
-      ++req_cycles;
-      spec_accepted_ += a;
+      ++spec_cycles_; ++req_cycles; spec_accepted_ += a;
       cycle_done(m);
-      pending_rb = m - 1;
-      pending_commit = m;
-      pending_pos = P;
-      pending_stride = d + 1;
+      pending_rb = m - 1; pending_commit = m; pending_pos = P; pending_stride = d + 1;
       P += m;
       if (ink2_spec_auto_) {
         if (a == 0) {
-          ++zero_streak;
-          cur_d = std::min(2, ink2_spec_);
-          if (zero_streak >= 2) {
-            plain_rem = 6;
-            zero_streak = 0;
-          }
+          ++zero_streak; cur_d = std::min(2, ink2_spec_);
+          if (zero_streak >= 2) { plain_rem = 6; zero_streak = 0; }
         } else {
           zero_streak = 0;
-          if (a == d) cur_d = std::min(ink2_spec_, cur_d + 2);
-          else cur_d = std::clamp(a + 1, 2, ink2_spec_);
+          cur_d = (a == d) ? std::min(ink2_spec_, cur_d + 2) : std::clamp(a + 1, 2, ink2_spec_);
         }
       }
-      if (go && contended()) {
-        flush_pending();
-        yield_turn(res);
-      }
+      if (go && contended()) { flush_pending(); yield_turn(res); }
     }
     flush_pending();
     fed_until = P;

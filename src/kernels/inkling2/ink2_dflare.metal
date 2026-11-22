@@ -741,3 +741,351 @@ struct DflAccP { uint pos, K; };
     accept_out[0] = int(a); accept_out[1] = bonus;
   }
 }
+
+// ---- Bayes-Optimal W=4 On-GPU Markov Beam Tree & Zero-Logits-D2H Tree Accept ----
+struct DflBeamState {
+  uint n_beam, pool_count;
+  int tok[4];
+  uint pool_idx[4];
+  float logp[4];
+};
+struct DflCandNode { int tok, parent_pool; uint depth; float path_logp; };
+struct DflTree {
+  uint R, depth[8], anc_mask[8];
+  int parent[8], par1[8], par2[8], par3[8], tokens[8];
+  uint n_child[8], child[8][7];
+};
+struct DflTreeAccept { int m, stop_node, bonus_tok, path[8]; };
+struct DflBeamPrepP { uint rank, H, V, first_step; };
+struct DflRescoreBeamP { uint V, H, R, u_f32, has_sup, sup_words; float softcap, inv_cap; };
+struct DflBeamStepP { uint V, R, d, R_budget, last_step; float inv_t; };
+struct DflTreeSelP { uint R_budget, pos; };
+
+NI_INLINE void dfl_tg_argmax(thread float& v, thread uint& i, threadgroup float* sv, threadgroup uint* si,
+                             uint tid, uint ntg) {
+  const uint lane = tid & 31u, sg = tid >> 5u, nsg = (ntg + 31u) >> 5u;
+  const float mv = simd_max(v);
+  const uint mi = simd_min(v == mv ? i : 0xffffffffu);
+  v = as_type<float>(simd_or(v == mv && i == mi ? as_type<uint>(v) : 0u));
+  i = mi;
+  if (lane == 0u) { sv[sg] = v; si[sg] = i; }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  if (sg == 0u) {
+    v = lane < nsg ? sv[lane] : -INFINITY;
+    i = lane < nsg ? si[lane] : 0xffffffffu;
+    const float mv2 = simd_max(v);
+    const uint mi2 = simd_min(v == mv2 ? i : 0xffffffffu);
+    v = as_type<float>(simd_or(v == mv2 && i == mi2 ? as_type<uint>(v) : 0u));
+    i = mi2;
+    if (lane == 0u) { sv[0] = v; si[0] = i; }
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  v = sv[0]; i = si[0];
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+}
+
+[[kernel]] void dflare_beam_init(const device int* tokens [[buffer(0)]], device DflBeamState* meta [[buffer(1)]],
+                                 device DflCandNode* cand_pool [[buffer(2)]], constant uint& pos [[buffer(3)]],
+                                 uint tid [[thread_index_in_threadgroup]]) {
+  if (tid != 0u) return;
+  const int root_tok = tokens[pos];
+  meta->n_beam = 1u; meta->pool_count = 1u;
+  meta->tok[0] = root_tok; meta->pool_idx[0] = 0u; meta->logp[0] = 0.0f;
+  for (uint b = 1u; b < 4u; ++b) { meta->tok[b] = 0; meta->pool_idx[b] = 0u; meta->logp[b] = -INFINITY; }
+  cand_pool[0] = {root_tok, -1, 0u, 0.0f};
+}
+
+[[kernel]] void dflare_beam_concat(const device DflBeamState* meta [[buffer(0)]], const device float* beam_state [[buffer(1)]],
+                                   const device bfloat* w1 [[buffer(2)]], const device float* hidden [[buffer(3)]],
+                                   const device float* rows_f [[buffer(4)]], device float* rnn_in [[buffer(5)]],
+                                   constant DflBeamPrepP& p [[buffer(6)]], uint2 gid [[thread_position_in_grid]]) {
+  const uint i = gid.x, b = gid.y, tot = 2u * p.rank + 2u * p.H;
+  if (i >= tot) return;
+  const size_t dst = size_t(b) * tot + i;
+  if (b >= meta->n_beam) { rnn_in[dst] = 0.0f; return; }
+  if (i < p.rank) rnn_in[dst] = p.first_step ? 0.0f : beam_state[size_t(b) * p.rank + i];
+  else if (i < 2u * p.rank) {
+    const int tid_v = meta->tok[b];
+    const uint uid = (tid_v >= 0 && uint(tid_v) < p.V) ? uint(tid_v) : 0u;
+    rnn_in[dst] = float(w1[size_t(uid) * p.rank + (i - p.rank)]);
+  } else if (i < 2u * p.rank + p.H) rnn_in[dst] = hidden[i - 2u * p.rank];
+  else rnn_in[dst] = rows_f[i - (2u * p.rank + p.H)];
+}
+
+[[kernel]] void dflare_beam_gru(const device DflBeamState* meta [[buffer(0)]], const device float* rnn_in [[buffer(1)]],
+                                const device bfloat* proj_w [[buffer(2)]], const device float* proj_b [[buffer(3)]],
+                                const device float* beam_state [[buffer(4)]], device float* beam_next_state [[buffer(5)]],
+                                device float* beam_latent [[buffer(6)]], constant DflBeamPrepP& p [[buffer(7)]],
+                                uint tg [[threadgroup_position_in_grid]], uint sg [[simdgroup_index_in_threadgroup]],
+                                uint lane [[thread_index_in_simdgroup]]) {
+  const uint r = tg * 4u + sg;
+  if (r >= p.rank) return;
+  const uint nb = min(meta->n_beam, 4u), K = 2u * p.rank + 2u * p.H;
+  float a0[4] = {}, a1[4] = {}, a2[4] = {};
+  const device bfloat *w0 = proj_w + size_t(r) * K, *w1 = w0 + size_t(p.rank) * K, *w2 = w1 + size_t(p.rank) * K;
+  for (uint k = lane * 4u; k < K; k += 128u) {
+    const float4 f0 = dfl_bf16_4(*(const device uint2*)(w0 + k)), f1 = dfl_bf16_4(*(const device uint2*)(w1 + k)),
+                 f2 = dfl_bf16_4(*(const device uint2*)(w2 + k));
+    _Pragma("clang loop unroll(full)")
+    for (uint b = 0u; b < 4u; ++b) if (b < nb) {
+      const float4 xv = *(const device float4*)(rnn_in + size_t(b) * K + k);
+      a0[b] += dot(xv, f0); a1[b] += dot(xv, f1); a2[b] += dot(xv, f2);
+    }
+  }
+  const float b0 = proj_b[r], b1 = proj_b[r + p.rank], b2 = proj_b[r + 2u * p.rank];
+  _Pragma("clang loop unroll(full)")
+  for (uint b = 0u; b < 4u; ++b) if (b < nb) {
+    const float p0 = simd_sum(a0[b]) + b0, p1 = simd_sum(a1[b]) + b1, p2 = simd_sum(a2[b]) + b2;
+    if (lane == 0u) {
+      const size_t roff = size_t(b) * p.rank + r;
+      const float sp_v = p.first_step ? 0.0f : beam_state[roff], gate = 1.0f / (1.0f + metal::precise::exp(-p0));
+      beam_next_state[roff] = gate * sp_v + (1.0f - gate) * metal::precise::tanh(p1);
+      beam_latent[roff] = metal::precise::tanh(p2);
+    }
+  }
+}
+
+[[kernel]] void dflare_p2_fold_screen_beam(const device DflBeamState* meta [[buffer(0)]], const device float* latents [[buffer(1)]],
+                                           const device uint2* fold_p2_q [[buffer(2)]], const device half* fold_p2_s [[buffer(3)]],
+                                           const device half* base_proxy [[buffer(4)]], const device uint* sup_mask [[buffer(5)]],
+                                           device float* beam_cand_v [[buffer(6)]], device uint* beam_cand_i [[buffer(7)]],
+                                           constant DflP2ScreenP& p [[buffer(8)]], uint tg [[threadgroup_position_in_grid]],
+                                           uint tid [[thread_index_in_threadgroup]], uint sg [[simdgroup_index_in_threadgroup]],
+                                           uint lane [[thread_index_in_simdgroup]]) {
+  threadgroup float sh_x[4][256], sh_sum[4][8], sh_v[4][64];
+  threadgroup uint sh_i[4][64];
+  const uint nb = min(meta->n_beam, 4u);
+  for (uint b = 0u; b < nb; ++b) {
+    const float xv = latents[size_t(b) * 256u + sg * 32u + lane];
+    sh_x[b][sg * 32u + lane] = xv;
+    const float s = simd_sum(xv);
+    if (lane == 0u) sh_sum[b][sg] = s;
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  float b0v[4] = {-INFINITY, -INFINITY, -INFINITY, -INFINITY}, b1v[4] = {-INFINITY, -INFINITY, -INFINITY, -INFINITY};
+  uint b0i[4] = {0xffffffffu, 0xffffffffu, 0xffffffffu, 0xffffffffu}, b1i[4] = {0xffffffffu, 0xffffffffu, 0xffffffffu, 0xffffffffu};
+  const uint ntg_row = (p.V + 31u) / 32u, blk = lane & 7u;
+  for (uint g = tg; g < ntg_row; g += 64u) {
+    const uint v = (g * 8u + sg) * 4u + (lane >> 3u);
+    const bool ok = v < p.V && dfl_tok_allowed(sup_mask, v, p.has_sup, p.sup_words);
+    float4 c[8]; float sc = 0.0f, bp = 0.0f;
+    if (ok) {
+      const size_t idx = size_t(v) * 8u + blk;
+      dfl_p2_unpack(fold_p2_q[idx], c); sc = float(fold_p2_s[idx]);
+      if (blk == 0u) bp = float(base_proxy[v]);
+    }
+    _Pragma("clang loop unroll(full)")
+    for (uint b = 0u; b < 4u; ++b) if (b < nb) {
+      float acc = ok ? dfl_p2_dot32(c, (const threadgroup float4*)(sh_x[b] + blk * 32u), sh_sum[b][blk], sc) : 0.0f;
+      acc += simd_shuffle_xor(acc, 1u); acc += simd_shuffle_xor(acc, 2u); acc += simd_shuffle_xor(acc, 4u);
+      if (blk == 0u && ok) dfl_top2(bp + acc, v, b0v[b], b0i[b], b1v[b], b1i[b]);
+    }
+  }
+  if (blk == 0u) {
+    const uint slot = sg * 4u + (lane >> 3u);
+    for (uint b = 0u; b < nb; ++b) {
+      sh_v[b][slot * 2u + 0u] = b0v[b]; sh_i[b][slot * 2u + 0u] = b0i[b];
+      sh_v[b][slot * 2u + 1u] = b1v[b]; sh_i[b][slot * 2u + 1u] = b1i[b];
+    }
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  if (tid < nb) {
+    float t0v = -INFINITY, t1v = -INFINITY; uint t0i = 0xffffffffu, t1i = 0xffffffffu;
+    for (uint j = 0u; j < 64u; ++j) if (sh_i[tid][j] != 0xffffffffu) dfl_top2(sh_v[tid][j], sh_i[tid][j], t0v, t0i, t1v, t1i);
+    const size_t out_off = size_t(tid) * 128u + tg * 2u;
+    beam_cand_v[out_off + 0u] = t0v; beam_cand_i[out_off + 0u] = t0i;
+    beam_cand_v[out_off + 1u] = t1v; beam_cand_i[out_off + 1u] = t1i;
+  }
+}
+
+[[kernel]] void dflare_rescore_beam(const device DflBeamState* meta [[buffer(0)]], const device float* x_u [[buffer(1)]],
+                                    const device float* beam_latent [[buffer(2)]], const device void* unembed [[buffer(3)]],
+                                    const device uchar* fold_q [[buffer(4)]], const device half* fold_s [[buffer(5)]],
+                                    const device float* fold_b [[buffer(6)]], const device uint* sup_mask [[buffer(7)]],
+                                    const device uint* beam_cand_i [[buffer(8)]], device float* beam_cand_v [[buffer(9)]],
+                                    constant DflRescoreBeamP& p [[buffer(10)]], uint2 tg [[threadgroup_position_in_grid]],
+                                    uint sg [[simdgroup_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]]) {
+  const uint b = tg.y;
+  if (b >= meta->n_beam) return;
+  const size_t c = size_t(b) * 128u + tg.x * 4u + sg;
+  const uint v = beam_cand_i[c];
+  if (v >= p.V || !dfl_tok_allowed(sup_mask, v, p.has_sup, p.sup_words)) { if (lane == 0u) beam_cand_v[c] = -INFINITY; return; }
+  float acc = 0.0f;
+  const size_t uoff = size_t(v) * p.H;
+  if (p.u_f32) {
+    const device float* uw = (const device float*)unembed + uoff;
+    for (uint k = lane * 4u; k < p.H; k += 128u) acc += dot(*(const device float4*)(x_u + k), *(const device float4*)(uw + k));
+  } else {
+    const device ushort* uw = (const device ushort*)unembed + uoff;
+    for (uint k = lane * 8u; k < p.H; k += 256u) {
+      const uint4 qu = *(const device uint4*)(uw + k);
+      acc += dot(*(const device float4*)(x_u + k + 0u), dfl_bf16_4(qu.xy)) + dot(*(const device float4*)(x_u + k + 4u), dfl_bf16_4(qu.zw));
+    }
+  }
+  const device float* x_f = beam_latent + size_t(b) * p.R;
+  const uint f_nblk = p.R >> 5u;
+  for (uint r = lane * 8u; r < p.R; r += 256u) {
+    const float sc = float(fold_s[size_t(v) * f_nblk + (r >> 5u)]);
+    const uint2 qf = *(const device uint2*)(fold_q + size_t(v) * p.R + r);
+    acc += (dot(*(const device float4*)(x_f + r + 0u), float4(as_type<char4>(qf.x))) +
+            dot(*(const device float4*)(x_f + r + 4u), float4(as_type<char4>(qf.y)))) * sc;
+  }
+  const float sum = simd_sum(acc);
+  if (lane == 0u) {
+    float val = sum + fold_b[v];
+    if (p.softcap > 0.0f) val = p.softcap * metal::precise::tanh(val * p.inv_cap);
+    beam_cand_v[c] = isnan(val) ? -INFINITY : val;
+  }
+}
+
+[[kernel]] void dflare_beam_step(device DflBeamState* meta [[buffer(0)]], device DflCandNode* cand_pool [[buffer(1)]],
+                                 const device float* beam_cand_v [[buffer(2)]], const device uint* beam_cand_i [[buffer(3)]],
+                                 const device float* beam_next_state [[buffer(4)]], device float* beam_state [[buffer(5)]],
+                                 constant DflBeamStepP& p [[buffer(6)]], uint tid [[thread_index_in_threadgroup]]) {
+  threadgroup float sv[4], sh_exp_lp[32];
+  threadgroup uint si[4], sh_exp_pidx[32], sh_exp_src[32], sh_nb, sh_src_beam[4];
+  threadgroup int sh_exp_tok[32];
+  const uint sg = tid >> 5u, lane = tid & 31u, nb = min(meta->n_beam, 4u);
+  const uint F = (p.d == 0u) ? min(7u, p.R_budget - 1u) : min(4u, p.R_budget - 1u);
+  uint exp_cnt = 0u;
+  for (uint b = 0u; b < nb; ++b) {
+    const uint id = beam_cand_i[size_t(b) * 128u + tid];
+    const float raw = (id < p.V) ? beam_cand_v[size_t(b) * 128u + tid] : -INFINITY;
+    const float ms = simd_max(raw);
+    if (lane == 0u) sv[sg] = ms;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (sg == 0u && lane == 0u) { float m = -INFINITY; for (uint s = 0u; s < 4u; ++s) m = max(m, sv[s]); sv[0] = m; }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    const float mx = sv[0];
+    if (!isfinite(mx)) continue;
+    const float u_w = (id < p.V && isfinite(raw)) ? metal::precise::exp((raw - mx) * p.inv_t) : 0.0f;
+    const float ss = simd_sum(u_w);
+    if (lane == 0u) sv[sg] = ss;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (sg == 0u && lane == 0u) { float s = 0.0f; for (uint k = 0u; k < 4u; ++k) s += sv[k]; sv[0] = s; }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    const float z = sv[0];
+    if (!(z > 0.0f) || !isfinite(z)) continue;
+    float lp = (id < p.V && isfinite(raw)) ? min(0.0f, (raw - mx) * p.inv_t - metal::precise::log(z)) : -INFINITY;
+    for (uint f = 0u; f < F; ++f) {
+      float plp = lp; uint pid = id;
+      dfl_tg_argmax(plp, pid, sv, si, tid, 128u);
+      if (pid >= p.V || !isfinite(plp)) break;
+      if (id == pid) lp = -INFINITY;
+      if (tid == 0u && exp_cnt < 32u && meta->pool_count < 128u) {
+        const uint p_idx = meta->pool_count;
+        const float new_lp = meta->logp[b] + plp;
+        cand_pool[p_idx] = {int(pid), int(meta->pool_idx[b]), p.d + 1u, new_lp};
+        meta->pool_count = p_idx + 1u;
+        sh_exp_lp[exp_cnt] = new_lp; sh_exp_tok[exp_cnt] = int(pid);
+        sh_exp_pidx[exp_cnt] = p_idx; sh_exp_src[exp_cnt] = b; ++exp_cnt;
+      }
+    }
+  }
+  if (!p.last_step) {
+    if (tid == 0u) {
+      const uint new_nb = min(4u, exp_cnt);
+      bool used[32] = {};
+      for (uint j = 0u; j < new_nb; ++j) {
+        int best = -1;
+        for (uint e = 0u; e < exp_cnt; ++e) if (!used[e] && (best < 0 || sh_exp_lp[e] > sh_exp_lp[best])) best = int(e);
+        used[best] = true;
+        meta->tok[j] = sh_exp_tok[best]; meta->pool_idx[j] = sh_exp_pidx[best];
+        meta->logp[j] = sh_exp_lp[best]; sh_src_beam[j] = sh_exp_src[best];
+      }
+      meta->n_beam = new_nb; sh_nb = new_nb;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    const uint new_nb = sh_nb;
+    for (uint j = 0u; j < new_nb; ++j) {
+      const uint sb = sh_src_beam[j];
+      for (uint c = tid; c < p.R; c += 128u) beam_state[size_t(j) * p.R + c] = beam_next_state[size_t(sb) * p.R + c];
+    }
+  }
+}
+
+[[kernel]] void dflare_tree_select(const device DflBeamState* meta [[buffer(0)]], const device DflCandNode* cand_pool [[buffer(1)]],
+                                   device DflTree* tree [[buffer(2)]], device int* kf_tree [[buffer(3)]],
+                                   device int* tokens [[buffer(4)]], constant DflTreeSelP& p [[buffer(5)]],
+                                   uint tid [[thread_index_in_threadgroup]]) {
+  threadgroup uint sh_idx[128], sh_dep[128];
+  threadgroup float sh_lp[128];
+  const uint n_pool = min(meta->pool_count, 128u), pi = 1u + tid;
+  if (pi < n_pool) { sh_idx[tid] = pi; sh_lp[tid] = cand_pool[pi].path_logp; sh_dep[tid] = cand_pool[pi].depth; }
+  else { sh_idx[tid] = 0xffffffffu; sh_lp[tid] = -INFINITY; sh_dep[tid] = 999u; }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  for (uint k = 2u; k <= 128u; k <<= 1u) {
+    for (uint j = k >> 1u; j > 0u; j >>= 1u) {
+      const uint ixj = tid ^ j;
+      if (ixj > tid) {
+        const bool asc = ((tid & k) == 0u);
+        const float lpa = sh_lp[tid], lpb = sh_lp[ixj];
+        const uint da = sh_dep[tid], db = sh_dep[ixj], ia = sh_idx[tid], ib = sh_idx[ixj];
+        const bool a_better = (lpa > lpb) || (lpa == lpb && (da < db || (da == db && ia < ib)));
+        if (asc ? !a_better : a_better) {
+          sh_lp[tid] = lpb; sh_lp[ixj] = lpa; sh_dep[tid] = db; sh_dep[ixj] = da; sh_idx[tid] = ib; sh_idx[ixj] = ia;
+        }
+      }
+      threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+  }
+  if (tid != 0u) return;
+  const uint R_lim = clamp(p.R_budget, 1u, 8u);
+  uchar sel[128]; int p2t[128];
+  for (uint i = 0u; i < 128u; ++i) { sel[i] = 0; p2t[i] = -1; }
+  sel[0] = 1; uint sel_cnt = 1u;
+  for (uint rank = 0u; rank < 128u && sel_cnt < R_lim; ++rank) {
+    const uint idx = sh_idx[rank];
+    if (idx >= n_pool || !isfinite(sh_lp[rank])) break;
+    const int par = cand_pool[idx].parent_pool;
+    if (par >= 0 && par < int(n_pool) && sel[par]) { sel[idx] = 1; ++sel_cnt; }
+  }
+  tree->depth[0] = 0u; tree->anc_mask[0] = 1u; tree->parent[0] = -1;
+  tree->par1[0] = -1; tree->par2[0] = -2; tree->par3[0] = -3; tree->tokens[0] = cand_pool[0].tok;
+  for (uint r = 0u; r < 8u; ++r) tree->n_child[r] = 0u;
+  tokens[p.pos] = cand_pool[0].tok; p2t[0] = 0;
+  kf_tree[0] = int(R_lim); kf_tree[33] = 0;
+  uint r_out = 1u;
+  for (uint i = 1u; i < n_pool && r_out < R_lim; ++i) {
+    if (!sel[i]) continue;
+    const int par_p = cand_pool[i].parent_pool;
+    const int tp = (par_p >= 0 && par_p < int(n_pool)) ? p2t[par_p] : -1;
+    if (tp < 0) continue;
+    const uint r = r_out++; p2t[i] = int(r);
+    tree->parent[r] = tp; tree->depth[r] = tree->depth[tp] + 1u; tree->anc_mask[r] = tree->anc_mask[tp] | (1u << r);
+    tree->par1[r] = tp; tree->par2[r] = tree->par1[tp]; tree->par3[r] = tree->par2[tp];
+    tree->tokens[r] = cand_pool[i].tok;
+    const uint nc = tree->n_child[tp];
+    if (nc < 7u) { tree->child[tp][nc] = r; tree->n_child[tp] = nc + 1u; }
+    tokens[p.pos + r] = cand_pool[i].tok; kf_tree[33u + r] = int(tree->depth[r]);
+  }
+  while (r_out < R_lim) {
+    const uint r = r_out++;
+    tree->parent[r] = 0; tree->depth[r] = 1u; tree->anc_mask[r] = 1u | (1u << r);
+    tree->par1[r] = 0; tree->par2[r] = -1; tree->par3[r] = -2; tree->tokens[r] = cand_pool[0].tok;
+    tokens[p.pos + r] = cand_pool[0].tok; kf_tree[33u + r] = 1;
+  }
+  tree->R = R_lim;
+}
+
+[[kernel]] void dflare_accept_tree_samples(const device DflTree* tree [[buffer(0)]], const device int* samp [[buffer(1)]],
+                                           device int* tokens [[buffer(2)]], device DflTreeAccept* out [[buffer(3)]],
+                                           constant uint& pos [[buffer(4)]], uint tid [[thread_index_in_threadgroup]]) {
+  if (tid != 0u) return;
+  const uint R_lim = min(tree->R, 8u);
+  int m = 1; uint u = 0u; out->path[0] = 0;
+  while (uint(m) < R_lim) {
+    const int target = samp[u];
+    const uint nc = min(tree->n_child[u], 7u);
+    int next_u = -1;
+    for (uint j = 0u; j < nc; ++j) {
+      const uint c = tree->child[u][j];
+      if (c < R_lim && tree->tokens[c] == target) { next_u = int(c); break; }
+    }
+    if (next_u < 0) break;
+    tokens[pos + uint(m)] = target; out->path[m] = next_u; u = uint(next_u); ++m;
+  }
+  const int bonus = samp[u];
+  tokens[pos + uint(m)] = bonus;
+  out->m = m; out->stop_node = int(u); out->bonus_tok = bonus;
+}

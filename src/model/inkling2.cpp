@@ -68,7 +68,8 @@ void prewarm_pipelines() {
       "ink2_sconv_dynamic",       "ink2_qkvr_prep",         "ink2_rel_bias",       "ink2_attn_decode",
       "ink2_attn_decode_reduce",  "ink2_attn_prefill",      "ink2_add",            "ink2_moe_route",
       "ink2_moe_nvfp4_w13_situ",  "ink2_moe_nvfp4_w2_acc",  "ink2_moe_mxfp8_w13_situ", "ink2_moe_mxfp8_w2_acc",
-      "ink2_softcap",
+      "ink2_softcap",             "ink2_sconv_static_tree", "ink2_sconv_dynamic_tree", "ink2_qkvr_prep_tree",
+      "ink2_attn_tree",           "ink2_kv_compact",          "ink2_gather_taps",
   };
   for (const char* n : kInk2Names) (void)ink2_pipe(n);
   (void)base_pipe("topk_stage1");
@@ -854,7 +855,7 @@ void Inkling2::enc_msg_gate(Encoder& e, const Ink2Ctrl& c, const Buffer& h, cons
 
 void Inkling2::enc_forward(Encoder& e, Seq& s, int pos0, int T, bool dump_logits, const Buffer* out_logits,
                            bool need_all_logits, const Buffer* diag_rows, const Buffer* taps_out,
-                           bool save_conv_snap) {
+                           bool save_conv_snap, const Buffer* tree_buf) {
   const uint32_t H = uint32_t(cfg_.hidden);
   const uint32_t QD = uint32_t(cfg_.hq) * uint32_t(cfg_.head_dim);
   const uint32_t KVD = uint32_t(cfg_.hkv) * uint32_t(cfg_.head_dim);
@@ -1003,30 +1004,32 @@ void Inkling2::enc_forward(Encoder& e, Seq& s, int pos0, int T, bool dump_logits
     if (L.is_swa) {
       const Ink2SconvStaticP sp{uint32_t(T), KVD, L.k_sconv->dtype == DType::F32 ? 1u : 0u, sconv_static_scale,
                                 snap_stride};
-      e.use(ink2_pipe("ink2_sconv_static"));
+      e.use(ink2_pipe(tree_buf ? "ink2_sconv_static_tree" : "ink2_sconv_static"));
       e.buf(0, k_);
       e.buf(1, L.k_sconv->buf);
       e.buf(2, conv_k);
       e.buf(3, k_);
       e.val(4, sp);
       e.buf(5, snap_stride ? conv_snap_.view(cbase + 0, conv_snap_.size - (cbase + 0)) : conv_k);
+      if (tree_buf) e.buf(6, *tree_buf);
       e.dispatch((KVD + 255) / 256, 1, 1, 256);
 
       const Ink2SconvStaticP svp{uint32_t(T), KVD, L.v_sconv->dtype == DType::F32 ? 1u : 0u, sconv_static_scale,
                                  snap_stride};
-      e.use(ink2_pipe("ink2_sconv_static"));
+      e.use(ink2_pipe(tree_buf ? "ink2_sconv_static_tree" : "ink2_sconv_static"));
       e.buf(0, v_);
       e.buf(1, L.v_sconv->buf);
       e.buf(2, conv_v);
       e.buf(3, v_);
       e.val(4, svp);
       e.buf(5, snap_stride ? conv_snap_.view(cbase + 3 * KVD * 4, conv_snap_.size - (cbase + 3 * KVD * 4)) : conv_v);
+      if (tree_buf) e.buf(6, *tree_buf);
       e.dispatch((KVD + 255) / 256, 1, 1, 256);
     } else {
       enc_mm(e, *L.k_proj, kn, dyn_, T);
       const Ink2SconvDynP dp{uint32_t(T), KVD, uint32_t(cfg_.hkv), L.k_static->dtype == DType::F32 ? 1u : 0u,
                              snap_stride};
-      e.use(ink2_pipe("ink2_sconv_dynamic"));
+      e.use(ink2_pipe(tree_buf ? "ink2_sconv_dynamic_tree" : "ink2_sconv_dynamic"));
       e.buf(0, k_);
       e.buf(1, dyn_);
       e.buf(2, L.k_static->buf);
@@ -1034,12 +1037,13 @@ void Inkling2::enc_forward(Encoder& e, Seq& s, int pos0, int T, bool dump_logits
       e.buf(4, k_);
       e.val(5, dp);
       e.buf(6, snap_stride ? conv_snap_.view(cbase + 0, conv_snap_.size - (cbase + 0)) : conv_k);
+      if (tree_buf) e.buf(7, *tree_buf);
       e.dispatch((KVD + 255) / 256, 1, 1, 256);
 
       enc_mm(e, *L.v_proj, vn, dyn_, T);
       const Ink2SconvDynP dvp{uint32_t(T), KVD, uint32_t(cfg_.hkv), L.v_static->dtype == DType::F32 ? 1u : 0u,
                               snap_stride};
-      e.use(ink2_pipe("ink2_sconv_dynamic"));
+      e.use(ink2_pipe(tree_buf ? "ink2_sconv_dynamic_tree" : "ink2_sconv_dynamic"));
       e.buf(0, v_);
       e.buf(1, dyn_);
       e.buf(2, L.v_static->buf);
@@ -1047,6 +1051,7 @@ void Inkling2::enc_forward(Encoder& e, Seq& s, int pos0, int T, bool dump_logits
       e.buf(4, v_);
       e.val(5, dvp);
       e.buf(6, snap_stride ? conv_snap_.view(cbase + 3 * KVD * 4, conv_snap_.size - (cbase + 3 * KVD * 4)) : conv_v);
+      if (tree_buf) e.buf(7, *tree_buf);
       e.dispatch((KVD + 255) / 256, 1, 1, 256);
     }
 
@@ -1067,7 +1072,7 @@ void Inkling2::enc_forward(Encoder& e, Seq& s, int pos0, int T, bool dump_logits
                          cfg_.rms_eps,
                          cfg_.log_floor,
                          cfg_.log_alpha};
-      e.use(ink2_pipe("ink2_qkvr_prep"));
+      e.use(ink2_pipe(tree_buf ? "ink2_qkvr_prep_tree" : "ink2_qkvr_prep"));
       e.buf(0, q_);
       e.buf(1, k_);
       e.buf(2, v_);
@@ -1077,6 +1082,7 @@ void Inkling2::enc_forward(Encoder& e, Seq& s, int pos0, int T, bool dump_logits
       e.buf(6, s.kc[v_idx]);
       e.buf(7, s.vc[v_idx]);
       e.val(8, qp);
+      if (tree_buf) e.buf(9, *tree_buf);
       e.dispatch(uint32_t(2 * cfg_.hq + 2 * cfg_.hkv), uint32_t(T), 1, uint32_t(cfg_.head_dim));
     }
 
@@ -1094,7 +1100,7 @@ void Inkling2::enc_forward(Encoder& e, Seq& s, int pos0, int T, bool dump_logits
 
     // Attention
     const float attn_scale = 1.0f / std::sqrt(float(cfg_.head_dim));
-    if (T == 1) {
+    if (T == 1 && !tree_buf) {
       const uint32_t lk = L.is_swa ? std::min(uint32_t(pos0 + 1), uint32_t(cfg_.swa)) : uint32_t(pos0 + 1);
       uint32_t chunk = std::max(32u, (lk + kMaxAttnChunks - 1) / kMaxAttnChunks);
       chunk = (chunk + 3) / 4 * 4;
@@ -1141,7 +1147,7 @@ void Inkling2::enc_forward(Encoder& e, Seq& s, int pos0, int T, bool dump_logits
                             L.is_swa ? 1u : 0u,
                             uint32_t(cfg_.swa),
                             attn_scale};
-      e.use(ink2_pipe("ink2_attn_prefill"));
+      e.use(ink2_pipe(tree_buf ? "ink2_attn_tree" : "ink2_attn_prefill"));
       e.buf(0, q_);
       e.buf(1, s.kc[v_idx]);
       e.buf(2, s.vc[v_idx]);
@@ -1150,6 +1156,7 @@ void Inkling2::enc_forward(Encoder& e, Seq& s, int pos0, int T, bool dump_logits
       e.buf(5, gate_attn_);
       e.buf(6, att_out_);
       e.val(7, apf);
+      if (tree_buf) e.buf(8, *tree_buf);
       e.dispatch(uint32_t(cfg_.hq), uint32_t(T), 1, 128);
     }
 
@@ -1158,13 +1165,14 @@ void Inkling2::enc_forward(Encoder& e, Seq& s, int pos0, int T, bool dump_logits
     {
       const Ink2SconvStaticP sp{uint32_t(T), H, L.attn_sconv->dtype == DType::F32 ? 1u : 0u, sconv_static_scale,
                                 snap_stride};
-      e.use(ink2_pipe("ink2_sconv_static"));
+      e.use(ink2_pipe(tree_buf ? "ink2_sconv_static_tree" : "ink2_sconv_static"));
       e.buf(0, a_out_);
       e.buf(1, L.attn_sconv->buf);
       e.buf(2, conv_a);
       e.buf(3, a_out_);
       e.val(4, sp);
       e.buf(5, snap_stride ? conv_snap_.view(cbase + 6 * KVD * 4, conv_snap_.size - (cbase + 6 * KVD * 4)) : conv_a);
+      if (tree_buf) e.buf(6, *tree_buf);
       e.dispatch((H + 255) / 256, 1, 1, 256);
     }
 
@@ -1259,7 +1267,7 @@ void Inkling2::enc_forward(Encoder& e, Seq& s, int pos0, int T, bool dump_logits
     {
       const Ink2SconvStaticP sp{uint32_t(T), H, L.mlp_sconv->dtype == DType::F32 ? 1u : 0u, sconv_static_scale,
                                 snap_stride};
-      e.use(ink2_pipe("ink2_sconv_static"));
+      e.use(ink2_pipe(tree_buf ? "ink2_sconv_static_tree" : "ink2_sconv_static"));
       e.buf(0, moe_out_);
       e.buf(1, L.mlp_sconv->buf);
       e.buf(2, conv_m);
@@ -1268,6 +1276,7 @@ void Inkling2::enc_forward(Encoder& e, Seq& s, int pos0, int T, bool dump_logits
       e.buf(5, snap_stride
                    ? conv_snap_.view(cbase + 6 * KVD * 4 + 3 * H * 4, conv_snap_.size - (cbase + 6 * KVD * 4 + 3 * H * 4))
                    : conv_m);
+      if (tree_buf) e.buf(6, *tree_buf);
       e.dispatch((H + 255) / 256, 1, 1, 256);
     }
     enc_copy_buf(e, ffn_inp_, x_, row_bytes);
@@ -1395,11 +1404,50 @@ void Inkling2::encode_verify(Encoder& e, Seq& s, int pos0, int T, const Buffer& 
   enc_logit_mask(e, s, out_logits, T, cfg_.vocab, cfg_.vocab);
 }
 
+void Inkling2::encode_verify_tree(Encoder& e, Seq& s, int pos0, int T, const Buffer& tree_buf, const Buffer& out_logits,
+                                  const Buffer* taps_out) {
+  if (T < 1 || T > kMaxVerify) fatal("inkling2: tree verify T=%d out of range", T);
+  if (pos0 + T > s.cap) fatal("context full (%d)", s.cap);
+  enc_forward(e, s, pos0, T, true, &out_logits, true, nullptr, taps_out, true, &tree_buf);
+  enc_logit_mask(e, s, out_logits, T, cfg_.vocab, cfg_.vocab);
+}
+
 void Inkling2::encode_conv_rollback(Encoder& e, Seq& s, int keep_idx, int total_rows) {
   if (keep_idx < 0 || keep_idx >= total_rows || !conv_snap_) return;
   if (keep_idx == total_rows - 1) return;
   const size_t cb = conv_bytes_per_seq(cfg_);
   enc_copy_buf(e, conv_snap_.view(size_t(keep_idx) * cb, cb), s.conv[0], cb);
+}
+
+bool Inkling2::encode_tree_commit_state(Encoder& e, Seq& s, int pos0, const int* path, int m, const Buffer& taps_in,
+                                        const Buffer& taps_out, int stride) {
+  if (m <= 0) return false;
+  const size_t cb = conv_bytes_per_seq(cfg_);
+  enc_copy_buf(e, conv_snap_.view(size_t(path[m - 1]) * cb, cb), s.conv[0], cb);
+  bool is_id = true;
+  for (int i = 0; i < m; ++i)
+    if (path[i] != i) { is_id = false; break; }
+  if (is_id) return false;
+  if (m > 1) {
+    struct { uint32_t pos0, kv_cap, is_swa, kvd, m, path[8]; } kcp{
+        uint32_t(pos0), 0u, 0u, uint32_t(cfg_.hkv * cfg_.head_dim), uint32_t(m), {}};
+    for (int i = 0; i < m; ++i) kcp.path[i] = uint32_t(path[i]);
+    const Pipeline cpl = ink2_pipe("ink2_kv_compact");
+    for (size_t v_idx = 0; v_idx < cfg_.schedule.size(); ++v_idx) {
+      const bool swa = cfg_.is_local[size_t(cfg_.schedule[v_idx])];
+      kcp.is_swa = swa ? 1u : 0u;
+      kcp.kv_cap = swa ? uint32_t(ring_rows_) : uint32_t(s.cap);
+      e.use(cpl);
+      e.buf(0, s.kc[v_idx]); e.buf(1, s.vc[v_idx]); e.val(2, kcp);
+      e.dispatch(1, 1, 1, kcp.kvd >> 2u);
+    }
+  }
+  struct { uint32_t m, stride, H, path[8]; } gtp{uint32_t(m), uint32_t(stride), uint32_t(cfg_.hidden), {}};
+  for (int i = 0; i < m; ++i) gtp.path[i] = uint32_t(path[i]);
+  e.use(ink2_pipe("ink2_gather_taps"));
+  e.buf(0, taps_in); e.buf(1, taps_out); e.val(2, gtp);
+  e.dispatch(((gtp.H >> 2u) + 255u) / 256u, uint32_t(m), 4u, 256u);
+  return true;
 }
 
 void Inkling2::enc_unembed(Encoder& e, const Buffer& h, const Buffer& out_logits, int rows) {

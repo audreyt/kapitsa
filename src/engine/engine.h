@@ -712,7 +712,7 @@ class Engine {
   std::unique_ptr<Ink2DFlare> ink2_dfl_;  // Inkling-2 bundled DFlare/DSpark drafter (mtp.safetensors)
   int ink2_spec_ = 0;                     // max DFlare drafts per cycle (0 = off, 1..7)
   bool ink2_spec_auto_ = false;           // adaptive depth when --spec is not explicitly set
-  Buffer ink2_pf_taps_, ink2_vf_taps_, ink2_vf_logits_;
+  Buffer ink2_pf_taps_, ink2_vf_taps_, ink2_vf_taps_gather_, ink2_vf_logits_;
   int flint_ngram_ = 0;      // Flint: prompt-lookup drafts per cycle (0: plain decoding)
   // Flint: self-drafts per cycle at long contexts (Flint::encode_draft; 0: none), their full-attention layers' window,
   // and the shortest prompt that takes them

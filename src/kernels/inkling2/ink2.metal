@@ -944,3 +944,192 @@ struct Ink2SoftcapP {
                              uint i [[thread_position_in_grid]]) {
   if (i < p.n) x[i] = p.cap * metal::precise::tanh(x[i] * p.inv_cap);
 }
+
+// ---- 14. Tree Verification & Compaction Kernels (DSpark W=4 Markov Beam Tree) ----
+struct Ink2Tree {
+  uint R, depth[8], anc_mask[8];
+  int parent[8], par1[8], par2[8], par3[8], tokens[8];
+  uint n_child[8], child[8][7];
+};
+
+[[kernel]] void ink2_sconv_static_tree(const device float* x [[buffer(0)]], const device void* w [[buffer(1)]],
+                                        const device float* hist [[buffer(2)]], device float* out [[buffer(3)]],
+                                        constant Ink2SconvStaticP& p [[buffer(4)]], device float* snap [[buffer(5)]],
+                                        const device Ink2Tree* tree [[buffer(6)]], uint c [[thread_position_in_grid]]) {
+  if (c >= p.C) return;
+  float w0, w1, w2, w3;
+  if (p.w_f32) {
+    const float4 wf = *(const device float4*)((const device float*)w + size_t(c) * 4u);
+    w0 = wf.x; w1 = wf.y; w2 = wf.z; w3 = wf.w;
+  } else {
+    const device bfloat* wb = (const device bfloat*)w + size_t(c) * 4u;
+    w0 = float(wb[0]); w1 = float(wb[1]); w2 = float(wb[2]); w3 = float(wb[3]);
+  }
+  const float h_init[3] = {hist[0 * p.C + c], hist[1 * p.C + c], hist[2 * p.C + c]};
+  const uint R = min(p.T, 8u);
+  float xv[8];
+  for (uint r = 0u; r < R; ++r) xv[r] = x[size_t(r) * p.C + c];
+  for (uint r = 0u; r < R; ++r) {
+    const int i3 = tree->par3[r], i2 = tree->par2[r], i1 = tree->par1[r];
+    const float h0 = (i3 >= 0) ? xv[i3] : h_init[i3 + 3], h1 = (i2 >= 0) ? xv[i2] : h_init[i2 + 3],
+                h2 = (i1 >= 0) ? xv[i1] : h_init[i1 + 3], xt = xv[r];
+    out[size_t(r) * p.C + c] = (w0 * h0 + w1 * h1 + w2 * h2 + w3 * xt + xt) * p.scale;
+    if (p.snap_stride) {
+      device float* sh = snap + size_t(r) * p.snap_stride;
+      sh[0 * p.C + c] = h1; sh[1 * p.C + c] = h2; sh[2 * p.C + c] = xt;
+    }
+  }
+}
+
+[[kernel]] void ink2_sconv_dynamic_tree(const device float* x [[buffer(0)]], const device float* dyn [[buffer(1)]],
+                                         const device void* static_w [[buffer(2)]], const device float* hist [[buffer(3)]],
+                                         device float* out [[buffer(4)]], constant Ink2SconvDynP& p [[buffer(5)]],
+                                         device float* snap [[buffer(6)]], const device Ink2Tree* tree [[buffer(7)]],
+                                         uint c [[thread_position_in_grid]]) {
+  if (c >= p.C) return;
+  const uint h = c / (p.C / p.n_heads);
+  float sw[4];
+  for (uint lag = 0u; lag < 4u; ++lag) {
+    const size_t idx = size_t(lag) * p.C + c;
+    sw[lag] = p.sw_f32 ? ((const device float*)static_w)[idx] : float(((const device bfloat*)static_w)[idx]);
+  }
+  const float h_init[3] = {hist[0 * p.C + c], hist[1 * p.C + c], hist[2 * p.C + c]};
+  const uint R = min(p.T, 8u);
+  float xv[8];
+  for (uint r = 0u; r < R; ++r) xv[r] = x[size_t(r) * p.C + c];
+  for (uint r = 0u; r < R; ++r) {
+    const int i3 = tree->par3[r], i2 = tree->par2[r], i1 = tree->par1[r];
+    const float h0 = (i3 >= 0) ? xv[i3] : h_init[i3 + 3], h1 = (i2 >= 0) ? xv[i2] : h_init[i2 + 3],
+                h2 = (i1 >= 0) ? xv[i1] : h_init[i1 + 3], xt = xv[r];
+    const float4 d = *(const device float4*)(dyn + (size_t(r) * p.n_heads + h) * 4u);
+    out[size_t(r) * p.C + c] = ((sw[0] + d.x) * xt + (sw[1] + d.y) * h2 + (sw[2] + d.z) * h1 + (sw[3] + d.w) * h0 + xt) * (1.0f / 3.0f);
+    if (p.snap_stride) {
+      device float* sh = snap + size_t(r) * p.snap_stride;
+      sh[0 * p.C + c] = h1; sh[1 * p.C + c] = h2; sh[2 * p.C + c] = xt;
+    }
+  }
+}
+
+[[kernel]] void ink2_qkvr_prep_tree(device float* q [[buffer(0)]], const device float* k [[buffer(1)]],
+                                     const device float* v [[buffer(2)]], device float* r [[buffer(3)]],
+                                     const device void* q_scale [[buffer(4)]], const device void* r_scale [[buffer(5)]],
+                                     device half* kc [[buffer(6)]], device half* vc [[buffer(7)]],
+                                     constant Ink2QkvrP& p [[buffer(8)]], const device Ink2Tree* tree [[buffer(9)]],
+                                     uint2 tg [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]]) {
+  threadgroup float scratch[32];
+  const uint kind_h = tg.x, t = tg.y, slot_pos = p.pos0 + t, slot = p.is_swa ? (slot_pos % p.kv_cap) : slot_pos;
+  const uint qpos = p.pos0 + tree->depth[t];
+  const float tau = p.is_swa ? 1.0f : (1.0f + p.log_alpha * metal::precise::log(max(1.0f, float(qpos + 1u) / p.log_floor)));
+  if (kind_h < p.Hq) {
+    const uint h = kind_h;
+    const size_t off = (size_t(t) * p.Hq + h) * p.D + tid, soff = size_t(h) * p.D + tid;
+    const float sc = p.scale_f32 ? ((const device float*)q_scale)[soff] : float(((const device bfloat*)q_scale)[soff]);
+    const float val = q[off] * sc, ss = tg_sum(val * val, scratch, tid, p.D);
+    q[off] = val * min(1.0f, p.qk_clip / (metal::precise::sqrt(ss) + 1e-6f)) * tau;
+    return;
+  }
+  uint rem = kind_h - p.Hq;
+  if (rem < p.Hkv) {
+    const uint h = rem;
+    const float val = k[(size_t(t) * p.Hkv + h) * p.D + tid], ss = tg_sum(val * val, scratch, tid, p.D);
+    kc[(size_t(slot) * p.Hkv + h) * p.D + tid] = half(val * min(1.0f, p.qk_clip / (metal::precise::sqrt(ss) + 1e-6f)));
+    return;
+  }
+  rem -= p.Hkv;
+  if (rem < p.Hkv) {
+    const uint h = rem;
+    const float val = v[(size_t(t) * p.Hkv + h) * p.D + tid], ss = tg_sum(val * val, scratch, tid, p.D);
+    vc[(size_t(slot) * p.Hkv + h) * p.D + tid] = half(val * metal::precise::rsqrt(ss / float(p.D) + p.v_eps));
+    return;
+  }
+  const uint h = rem - p.Hkv;
+  const size_t off = (size_t(t) * p.Hq + h) * p.d_rel + tid, soff = size_t(h) * p.d_rel + tid;
+  float val = 0.0f;
+  if (tid < p.d_rel) {
+    const float sc = p.scale_f32 ? ((const device float*)r_scale)[soff] : float(((const device bfloat*)r_scale)[soff]);
+    val = r[off] * sc;
+  }
+  const float ss = tg_sum(val * val, scratch, tid, p.D);
+  if (tid < p.d_rel) r[off] = val * min(1.0f, p.r_clip / (metal::precise::sqrt(ss) + 1e-6f)) * tau;
+}
+
+[[kernel]] void ink2_attn_tree(const device float* q [[buffer(0)]], const device half* kc [[buffer(1)]],
+                               const device half* vc [[buffer(2)]], const device float* rb [[buffer(3)]],
+                               const device float* sinks [[buffer(4)]], const device float* gate [[buffer(5)]],
+                               device float* out [[buffer(6)]], constant Ink2AttnPfP& p [[buffer(7)]],
+                               const device Ink2Tree* tree [[buffer(8)]], uint2 tg [[threadgroup_position_in_grid]],
+                               uint sg [[simdgroup_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]]) {
+  threadgroup float tgm[4], tgl[4], tgo[4][128];
+  const uint h = tg.x, t = tg.y, hkv = h / (p.Hq / p.Hkv), d0 = lane * 4u;
+  const size_t qoff = (size_t(t) * p.Hq + h) * p.D + d0;
+  const float4 qv = *(const device float4*)(q + qoff);
+  const device float* rbh = rb + (size_t(t) * p.Hq + h) * p.rel_extent;
+  const uint qdepth = tree->depth[t], qanc = tree->anc_mask[t], qpos = p.pos0 + qdepth;
+  const uint c0 = (p.is_swa && qpos + 1u > p.swa) ? (qpos + 1u - p.swa) : 0u;
+  float mw = -INFINITY, lw = 0.0f;
+  float4 ow = float4(0.0f);
+  for (uint kp = c0 + sg; kp < p.pos0; kp += 4u) {
+    const uint slot = p.is_swa ? (kp % p.kv_cap) : kp;
+    const size_t koff = (size_t(slot) * p.Hkv + hkv) * p.D + d0;
+    const float4 kv = float4(*(const device half4*)(kc + koff)), vv = float4(*(const device half4*)(vc + koff));
+    float sc = simd_sum(dot(qv, kv)) * p.scale;
+    const uint dist = qpos - kp;
+    if (dist < p.rel_extent) sc += rbh[dist];
+    if (lw == 0.0f) { mw = sc; lw = 1.0f; ow = vv; }
+    else { const float nm = max(mw, sc), e1 = metal::precise::exp(mw - nm), e2 = metal::precise::exp(sc - nm); ow = ow * e1 + vv * e2; lw = lw * e1 + e2; mw = nm; }
+  }
+  for (uint j = 0u; j < p.T; ++j) {
+    if (((qanc >> j) & 1u) == 0u || (((p.pos0 + tree->depth[j] - c0) & 3u) != sg)) continue;
+    const uint kp = p.pos0 + j, slot = p.is_swa ? (kp % p.kv_cap) : kp;
+    const size_t koff = (size_t(slot) * p.Hkv + hkv) * p.D + d0;
+    const float4 kv = float4(*(const device half4*)(kc + koff)), vv = float4(*(const device half4*)(vc + koff));
+    float sc = simd_sum(dot(qv, kv)) * p.scale;
+    const uint dist = qdepth - tree->depth[j];
+    if (dist < p.rel_extent) sc += rbh[dist];
+    if (lw == 0.0f) { mw = sc; lw = 1.0f; ow = vv; }
+    else { const float nm = max(mw, sc), e1 = metal::precise::exp(mw - nm), e2 = metal::precise::exp(sc - nm); ow = ow * e1 + vv * e2; lw = lw * e1 + e2; mw = nm; }
+  }
+  if (lane == 0u) { tgm[sg] = mw; tgl[sg] = lw; }
+  *(threadgroup float4*)(&tgo[sg][d0]) = ow;
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  if (sg == 0u) {
+    float mm = sinks[size_t(t) * p.Hq + h], ll = 1.0f;
+    float4 oo = float4(0.0f);
+    for (uint s = 0u; s < 4u; ++s) {
+      const float l2 = tgl[s];
+      if (l2 == 0.0f) continue;
+      const float m2 = tgm[s]; const float4 o2 = *(const threadgroup float4*)(&tgo[s][d0]);
+      const float nm = max(mm, m2), e1 = metal::precise::exp(mm - nm), e2 = metal::precise::exp(m2 - nm);
+      oo = oo * e1 + o2 * e2; ll = ll * e1 + l2 * e2; mm = nm;
+    }
+    const float4 g4 = *(const device float4*)(gate + qoff);
+    const float4 sig = float4(1.0f) / (float4(1.0f) + float4(metal::precise::exp(-g4.x), metal::precise::exp(-g4.y),
+                                                             metal::precise::exp(-g4.z), metal::precise::exp(-g4.w)));
+    *(device float4*)(out + qoff) = (oo / ll) * sig;
+  }
+}
+
+struct Ink2KvCompactP { uint pos0, kv_cap, is_swa, kvd, m, path[8]; };
+
+[[kernel]] void ink2_kv_compact(device half* kc [[buffer(0)]], device half* vc [[buffer(1)]],
+                                constant Ink2KvCompactP& p [[buffer(2)]], uint tid [[thread_index_in_threadgroup]]) {
+  const uint c4 = tid * 4u, m = min(p.m, 8u);
+  if (c4 >= p.kvd || m <= 1u) return;
+  for (uint k = 1u; k < m; ++k) {
+    if (p.path[k] == k) continue;
+    const uint spos = p.pos0 + p.path[k], dpos = p.pos0 + k;
+    const uint sslot = p.is_swa ? (spos % p.kv_cap) : spos, dslot = p.is_swa ? (dpos % p.kv_cap) : dpos;
+    const size_t soff = size_t(sslot) * p.kvd + c4, doff = size_t(dslot) * p.kvd + c4;
+    *(device uint2*)(kc + doff) = *(const device uint2*)(kc + soff);
+    *(device uint2*)(vc + doff) = *(const device uint2*)(vc + soff);
+  }
+}
+
+struct Ink2GatherTapsP { uint m, stride, H, path[8]; };
+
+[[kernel]] void ink2_gather_taps(const device float4* src [[buffer(0)]], device float4* dst [[buffer(1)]],
+                                 constant Ink2GatherTapsP& p [[buffer(2)]], uint3 gid [[thread_position_in_grid]]) {
+  const uint h4 = p.H >> 2u, c4 = gid.x, k = gid.y, b = gid.z;
+  if (c4 >= h4 || k >= p.m) return;
+  dst[(size_t(b) * p.m + k) * h4 + c4] = src[(size_t(b) * p.stride + p.path[k]) * h4 + c4];
+}
