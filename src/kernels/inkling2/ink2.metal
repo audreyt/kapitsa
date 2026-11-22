@@ -932,79 +932,173 @@ struct Ink2SoftcapP {
 }
 
 // ---- 14. Q8_0 Load-Packed Dense Projections & Unembed (int8 codes [N, K] + half scales [N, K/32]) ----
-NI_INLINE float ink2_q8_dot16(uint4 v, const device float4* xp) {
-  float d = 0.0f;
-  for (uint m = 0; m < 4; ++m) {
-    const uint w = v[m];
-    const float4 xv = xp[m];
-    d += float(as_type<char>(uchar(w & 0xFFu))) * xv.x +
-         float(as_type<char>(uchar((w >> 8) & 0xFFu))) * xv.y +
-         float(as_type<char>(uchar((w >> 16) & 0xFFu))) * xv.z +
-         float(as_type<char>(uchar((w >> 24) & 0xFFu))) * xv.w;
-  }
-  return d;
-}
+struct Ink2Q8MmP {
+  uint M, N, K, nblk, add;
+  float cap, inv_cap;
+};
 
-[[kernel]] void ink2_q8_mv1(const device float* x [[buffer(0)]], const device uchar* q [[buffer(1)]],
-                            const device half* s [[buffer(2)]], device float* y [[buffer(3)]],
-                            constant Ink2MmP& p [[buffer(4)]], uint tg [[threadgroup_position_in_grid]],
-                            uint sg [[simdgroup_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]]) {
-  const uint n0 = (tg * 4 + sg) * 2;
+struct Ink2Q8Multi5P {
+  uint M, K, N_tot, nblk;
+  uint offs[6];
+};
+
+template <uint RM>
+NI_INLINE void ink2_q8_mv_impl(const device float* x, const device uchar* wq, const device half* ws,
+                               device float* y, constant Ink2Q8MmP& p, uint tg, uint sg, uint lane) {
+  const uint n0 = (tg * 4u + sg) * 2u;
   if (n0 >= p.N) return;
-  const bool has1 = (n0 + 1) < p.N;
-  const uint blocks = p.K / 32;
-  const size_t qoff0 = size_t(n0) * p.K;
-  const size_t qoff1 = qoff0 + p.K;
-  const size_t soff0 = size_t(n0) * blocks;
-  const size_t soff1 = soff0 + blocks;
-  float acc0 = 0.0f, acc1 = 0.0f;
-  for (uint blk = lane; blk < blocks; blk += 32) {
-    const device float4* xp = (const device float4*)(x + blk * 32);
-    const device uint4* q0 = (const device uint4*)(q + qoff0 + blk * 32);
-    const float d0 = ink2_q8_dot16(q0[0], xp) + ink2_q8_dot16(q0[1], xp + 4);
-    acc0 += d0 * float(s[soff0 + blk]);
-    if (has1) {
-      const device uint4* q1 = (const device uint4*)(q + qoff1 + blk * 32);
-      const float d1 = ink2_q8_dot16(q1[0], xp) + ink2_q8_dot16(q1[1], xp + 4);
-      acc1 += d1 * float(s[soff1 + blk]);
+  const bool has1 = (n0 + 1u) < p.N;
+  const size_t woff0 = size_t(n0) * p.K;
+  const size_t woff1 = has1 ? (woff0 + p.K) : woff0;
+  const size_t soff0 = size_t(n0) * p.nblk;
+  const size_t soff1 = has1 ? (soff0 + p.nblk) : soff0;
+  float acc0[RM] = {};
+  float acc1[RM] = {};
+  const uint kl = lane * 8u;
+  const uint blk_loc = lane >> 2u;
+  for (uint kbase = 0u; kbase < p.K; kbase += 256u) {
+    if (kl < p.K - kbase) {
+      const uint blk = (kbase >> 5u) + blk_loc;
+      const uint2 qw0 = *(const device uint2*)(wq + woff0 + kbase + kl);
+      const float sc0 = float(ws[soff0 + blk]);
+      const float4 w0a = float4(as_type<char4>(qw0.x)) * sc0;
+      const float4 w0b = float4(as_type<char4>(qw0.y)) * sc0;
+      const uint2 qw1 = has1 ? *(const device uint2*)(wq + woff1 + kbase + kl) : qw0;
+      const float sc1 = has1 ? float(ws[soff1 + blk]) : sc0;
+      const float4 w1a = float4(as_type<char4>(qw1.x)) * sc1;
+      const float4 w1b = float4(as_type<char4>(qw1.y)) * sc1;
+      _Pragma("clang loop unroll(full)")
+      for (uint m = 0u; m < RM; ++m) {
+        if (RM == 8u && m >= p.M) continue;
+        const device float* xp = x + size_t(m) * p.K + kbase + kl;
+        const float4 xv0 = *(const device float4*)(xp + 0u);
+        const float4 xv1 = *(const device float4*)(xp + 4u);
+        acc0[m] += dot(xv0, w0a) + dot(xv1, w0b);
+        acc1[m] += dot(xv0, w1a) + dot(xv1, w1b);
+      }
     }
   }
-  const float s0 = simd_sum(acc0);
-  const float s1 = has1 ? simd_sum(acc1) : 0.0f;
-  if (lane == 0) {
-    y[n0] = p.add ? (y[n0] + s0) : s0;
-    if (has1) y[n0 + 1] = p.add ? (y[n0 + 1] + s1) : s1;
+  _Pragma("clang loop unroll(full)")
+  for (uint m = 0u; m < RM; ++m) {
+    if (RM == 8u && m >= p.M) break;
+    const float s0 = simd_sum(acc0[m]);
+    const float s1 = simd_sum(acc1[m]);
+    if (lane == 0u) {
+      device float* dst = y + size_t(m) * p.N + n0;
+      float v0 = p.add ? (dst[0] + s0) : s0;
+      if (p.cap > 0.0f) v0 = p.cap * metal::precise::tanh(v0 * p.inv_cap);
+      dst[0] = v0;
+      if (has1) {
+        float v1 = p.add ? (dst[1] + s1) : s1;
+        if (p.cap > 0.0f) v1 = p.cap * metal::precise::tanh(v1 * p.inv_cap);
+        dst[1] = v1;
+      }
+    }
   }
 }
 
-[[kernel]] void ink2_q8_mv(const device float* x [[buffer(0)]], const device uchar* q [[buffer(1)]],
-                           const device half* s [[buffer(2)]], device float* y [[buffer(3)]],
-                           constant Ink2MmP& p [[buffer(4)]], uint2 tg [[threadgroup_position_in_grid]],
-                           uint sg [[simdgroup_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]]) {
-  const uint n = tg.x * 4 + sg;
-  if (n >= p.N) return;
-  const uint m0 = tg.y * 8;
-  const uint mc = min(8u, p.M - m0);
-  const uint blocks = p.K / 32;
-  const size_t qoff = size_t(n) * p.K;
-  const size_t soff = size_t(n) * blocks;
-  float acc[8] = {0, 0, 0, 0, 0, 0, 0, 0};
-  for (uint blk = lane; blk < blocks; blk += 32) {
-    const float sc = float(s[soff + blk]);
-    const device uint4* qp = (const device uint4*)(q + qoff + blk * 32);
-    const uint4 v0 = qp[0], v1 = qp[1];
-    for (uint m = 0; m < mc; ++m) {
-      const device float4* xp = (const device float4*)(x + size_t(m0 + m) * p.x_ld + blk * 32);
-      acc[m] += (ink2_q8_dot16(v0, xp) + ink2_q8_dot16(v1, xp + 4)) * sc;
+[[kernel]] void ink2_q8_mv4(const device float* x [[buffer(0)]], const device uchar* wq [[buffer(1)]],
+                             const device half* ws [[buffer(2)]], device float* y [[buffer(3)]],
+                             constant Ink2Q8MmP& p [[buffer(4)]], uint tg [[threadgroup_position_in_grid]],
+                             uint sg [[simdgroup_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]]) {
+  switch (p.M) {
+    case 1u: ink2_q8_mv_impl<1u>(x, wq, ws, y, p, tg, sg, lane); break;
+    case 2u: ink2_q8_mv_impl<2u>(x, wq, ws, y, p, tg, sg, lane); break;
+    case 3u: ink2_q8_mv_impl<3u>(x, wq, ws, y, p, tg, sg, lane); break;
+    default: ink2_q8_mv_impl<4u>(x, wq, ws, y, p, tg, sg, lane); break;
+  }
+}
+
+[[kernel]] void ink2_q8_mv8(const device float* x [[buffer(0)]], const device uchar* wq [[buffer(1)]],
+                             const device half* ws [[buffer(2)]], device float* y [[buffer(3)]],
+                             constant Ink2Q8MmP& p [[buffer(4)]], uint tg [[threadgroup_position_in_grid]],
+                             uint sg [[simdgroup_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]]) {
+  ink2_q8_mv_impl<8u>(x, wq, ws, y, p, tg, sg, lane);
+}
+
+template <uint RM>
+NI_INLINE void ink2_q8_multi5_impl(const device float* x0, const device float* x1, const device float* x2,
+                                   const device uchar* wq, const device half* ws, device float* y0, device float* y1,
+                                   device float* y2, device float* y3, device float* y4,
+                                   constant Ink2Q8Multi5P& p, uint tg, uint sg, uint lane) {
+  const uint n0 = (tg * 4u + sg) * 2u;
+  if (n0 >= p.N_tot) return;
+  uint seg = 0u;
+  while (seg < 4u && n0 >= p.offs[seg + 1u]) ++seg;
+  const uint seg_off = p.offs[seg];
+  const uint seg_len = p.offs[seg + 1u] - seg_off;
+  if (n0 >= seg_off + seg_len) return;
+  const bool has1 = (n0 + 1u) < (seg_off + seg_len);
+  const device float* x = (seg < 3u) ? x0 : (seg == 3u ? x1 : x2);
+
+  float acc0[RM] = {};
+  float acc1[RM] = {};
+  const size_t woff0 = size_t(n0) * p.K;
+  const size_t woff1 = has1 ? (woff0 + p.K) : woff0;
+  const size_t soff0 = size_t(n0) * p.nblk;
+  const size_t soff1 = has1 ? (soff0 + p.nblk) : soff0;
+  const uint kl = lane * 8u;
+  const uint blk_loc = lane >> 2u;
+  for (uint kbase = 0u; kbase < p.K; kbase += 256u) {
+    if (kl < p.K - kbase) {
+      const uint blk = (kbase >> 5u) + blk_loc;
+      const uint2 qw0 = *(const device uint2*)(wq + woff0 + kbase + kl);
+      const float sc0 = float(ws[soff0 + blk]);
+      const float4 w0a = float4(as_type<char4>(qw0.x)) * sc0;
+      const float4 w0b = float4(as_type<char4>(qw0.y)) * sc0;
+      const uint2 qw1 = has1 ? *(const device uint2*)(wq + woff1 + kbase + kl) : qw0;
+      const float sc1 = has1 ? float(ws[soff1 + blk]) : sc0;
+      const float4 w1a = float4(as_type<char4>(qw1.x)) * sc1;
+      const float4 w1b = float4(as_type<char4>(qw1.y)) * sc1;
+      _Pragma("clang loop unroll(full)")
+      for (uint m = 0u; m < RM; ++m) {
+        if (RM == 8u && m >= p.M) continue;
+        const device float* xp = x + size_t(m) * p.K + kbase + kl;
+        const float4 xv0 = *(const device float4*)(xp + 0u);
+        const float4 xv1 = *(const device float4*)(xp + 4u);
+        acc0[m] += dot(xv0, w0a) + dot(xv1, w0b);
+        acc1[m] += dot(xv0, w1a) + dot(xv1, w1b);
+      }
     }
   }
-  for (uint m = 0; m < mc; ++m) {
-    const float sum = simd_sum(acc[m]);
-    if (lane == 0) {
-      device float* dst = y + size_t(m0 + m) * p.y_ld + n;
-      *dst = p.add ? (*dst + sum) : sum;
+  device float* bases[5] = {y0, y1, y2, y3, y4};
+  device float* dst_base = bases[seg] + (n0 - seg_off);
+  _Pragma("clang loop unroll(full)")
+  for (uint m = 0u; m < RM; ++m) {
+    if (RM == 8u && m >= p.M) break;
+    const float s0 = simd_sum(acc0[m]);
+    const float s1 = simd_sum(acc1[m]);
+    if (lane == 0u) {
+      device float* dst = dst_base + size_t(m) * seg_len;
+      dst[0] = s0;
+      if (has1) dst[1] = s1;
     }
   }
+}
+
+[[kernel]] void ink2_q8_mv4_multi5(const device float* x0 [[buffer(0)]], const device float* x1 [[buffer(1)]],
+                                    const device float* x2 [[buffer(2)]], const device uchar* wq [[buffer(3)]],
+                                    const device half* ws [[buffer(4)]], device float* y0 [[buffer(5)]],
+                                    device float* y1 [[buffer(6)]], device float* y2 [[buffer(7)]],
+                                    device float* y3 [[buffer(8)]], device float* y4 [[buffer(9)]],
+                                    constant Ink2Q8Multi5P& p [[buffer(10)]], uint tg [[threadgroup_position_in_grid]],
+                                    uint sg [[simdgroup_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]]) {
+  switch (p.M) {
+    case 1u: ink2_q8_multi5_impl<1u>(x0, x1, x2, wq, ws, y0, y1, y2, y3, y4, p, tg, sg, lane); break;
+    case 2u: ink2_q8_multi5_impl<2u>(x0, x1, x2, wq, ws, y0, y1, y2, y3, y4, p, tg, sg, lane); break;
+    case 3u: ink2_q8_multi5_impl<3u>(x0, x1, x2, wq, ws, y0, y1, y2, y3, y4, p, tg, sg, lane); break;
+    default: ink2_q8_multi5_impl<4u>(x0, x1, x2, wq, ws, y0, y1, y2, y3, y4, p, tg, sg, lane); break;
+  }
+}
+
+[[kernel]] void ink2_q8_mv8_multi5(const device float* x0 [[buffer(0)]], const device float* x1 [[buffer(1)]],
+                                    const device float* x2 [[buffer(2)]], const device uchar* wq [[buffer(3)]],
+                                    const device half* ws [[buffer(4)]], device float* y0 [[buffer(5)]],
+                                    device float* y1 [[buffer(6)]], device float* y2 [[buffer(7)]],
+                                    device float* y3 [[buffer(8)]], device float* y4 [[buffer(9)]],
+                                    constant Ink2Q8Multi5P& p [[buffer(10)]], uint tg [[threadgroup_position_in_grid]],
+                                    uint sg [[simdgroup_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]]) {
+  ink2_q8_multi5_impl<8u>(x0, x1, x2, wq, ws, y0, y1, y2, y3, y4, p, tg, sg, lane);
 }
 
 [[kernel]] void ink2_q8_mm(const device float* X [[buffer(0)]], const device uchar* Q [[buffer(1)]],

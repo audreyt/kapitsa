@@ -84,6 +84,8 @@ struct Ink2Layer {
   const Tensor *router_w = nullptr, *router_bias = nullptr;
   const Tensor *w13 = nullptr, *w13_sc = nullptr, *w2 = nullptr, *w2_sc = nullptr;
   Buffer w13_outer, w2_outer;  // FP32 [128] = amax[e] / outer_scale_denominator[0] (NVFP4 only)
+  Buffer qkvrg_q, qkvrg_s;     // Fused Q8_0 [wq_du; wr_du; gate_attn; wk_dv; wv_dv]
+  uint32_t qkvrg_offs[6] = {};
 };
 
 class Inkling2 : public Model {
@@ -133,7 +135,7 @@ class Inkling2 : public Model {
   void enc_mm(Encoder& e, const Tensor& w, const Buffer& x, const Buffer& y, int M, uint32_t N_limit = 0, bool add = false,
               bool exact_f32 = false);
   void enc_mm(Encoder& e, const Ink2Mat& w, const Buffer& x, const Buffer& y, int M, uint32_t N_limit = 0, bool add = false,
-              bool exact_f32 = false);
+              bool exact_f32 = false, float cap = 0.0f);
   void enc_norm(Encoder& e, const Buffer& x, const Tensor* w, const Buffer& out, int T, uint32_t dim);
   void enc_attn_res(Encoder& e, const Buffer* const* states, int M, const void* query_ptr, bool q_f32, uint32_t Q,
                     const Buffer& out, int T);
