@@ -9,3 +9,5 @@ kernels). Those runs stay in [bench/results/2026-10-17-m5-max](../bench/results/
 sessions: [Flash-Next](../bench/results/2026-10-18-m5-max-flash-next/README.md),
 [Super-VL](../bench/results/2026-10-18-m5-max/README.md), [Lightning](../bench/results/2026-10-18-m5-max-lightning/README.md)
 and [every engine](../bench/results/2026-10-18-m5-max-session/README.md).
+
+For Thinking Machines' Inkling-2-Mini (`--profile fast` + DSpark W=4 beam tree + Metal 4 tensor prefill), see [docs/inkling2-dspark.md](inkling2-dspark.md).

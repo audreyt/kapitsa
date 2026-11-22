@@ -80,8 +80,8 @@ struct Ink2Layer {
   const Tensor *w13 = nullptr, *w13_sc = nullptr, *w2 = nullptr, *w2_sc = nullptr;
   Buffer w13_outer, w2_outer;  // FP32 [128] = amax[e] / outer_scale_denominator[0] (NVFP4 only)
   Buffer qkvrsg_w;             // Fused BF16 [wq_du; wr_du; attn_sink_proj; gate_attn; wk_dv; wv_dv]
-  Buffer qkvrsg_q, qkvrsg_s;   // Q8_0 weights & scales (fast profile T <= 8)
-  Buffer wo_q, wo_s;           // Q8_0 wo_ud weights & scales (fast profile T <= 8)
+  Buffer qkvrsg_q, qkvrsg_s;   // Q8_0 weights & scales (fast profile T <= 16)
+  Buffer wo_q, wo_s;           // Q8_0 wo_ud weights & scales (fast profile T <= 16)
   uint32_t qkvrsg_offs[7] = {};
   uint32_t qkvrsg_lens[6] = {};
 };
@@ -104,7 +104,8 @@ class Inkling2 : public Model {
   int prefill_chunk() const override { return tmax_; }
   bool can_snapshot() const override { return false; }
   bool grouped_passes() const override { return true; }
-  bool use_tensor() const { return use_tensor_; }
+  bool use_tensor() const { return tensor_pf_; }
+  bool quantized_dense() const { return use_q8_dense_ || use_q8_head_ || use_q4_head_; }
   void set_use_tensor(bool on);
   bool has_mtp() const { return mtp_ != nullptr; }
   int mtp_block() const;
@@ -185,7 +186,7 @@ class Inkling2 : public Model {
   int tmax_ = 512;
   int ring_rows_ = 0;
   size_t mem_budget_ = 0;
-  bool use_tensor_ = false;
+  bool tensor_pf_ = false;
   bool use_q8_dense_ = false;
   bool use_q8_head_ = false;
   bool use_q4_head_ = false;
@@ -200,12 +201,13 @@ class Inkling2 : public Model {
   Buffer ar_out_;           // attn_res output: up to 4 * tmax * H
   Buffer msg_out_;          // cross-pass messages: 4 * tmax * H
   Buffer pass_msg_out_;     // hoisted cross-pass messages (T <= 16): [12, 4, 16, H]
-  Buffer mg_cat_, mg_lat_;  // split MessageGate staging buffers (T <= 16)
+  Buffer mg_cat_, mg_lat_;  // split MessageGate staging buffers (T <= 16 and T >= 32)
   Buffer mg_f_, mg_g_;
   Buffer n0_, n1_, n2_;     // normed inputs [tmax, H]
   Buffer q_, k_, v_, r_, sinks_, gate_attn_, att_out_, a_out_;
   Buffer dyn_, dyn_v_, rb_, part_m_, part_l_, part_o_;
   Buffer h_mlp_, x_mlp_, rlog_, eid_, ew_, moe_act_, moe_out_;
+  Buffer moe_sorted_, moe_rank_, moe_tmp_, moe_act_h_;
   Buffer moe_tiles_, moe_ntiles_, moe_st_tok_, moe_st_pair_, moe_st_ew_, moe_pair_out_;
   Buffer logits_, cand_v_, cand_i_, sprob_, samp_;
   std::unique_ptr<Ink2Mtp> mtp_;

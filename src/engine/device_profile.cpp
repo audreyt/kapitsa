@@ -162,13 +162,14 @@ const DefaultRow kDefaults[] = {
     // unchanged; 1,024 rows against precise: 86 top-1 flips, mean KL 0.137, inside its bar (MLX on the same pack).
     {"a4_qtm_fast", Knob::kA4QtmFast, ModelClass::kOther, DefaultScope::kMatrix, nullptr, "on", 56, 58, false,
      "M5 Max; fast profile only", true},
-    // Fast profile only (docs/profiles.md): Inkling-2-Mini prefill on the matrix units
-    // (src/kernels/inkling2_tensor/ink2_tensor.metal, NI_INK2_TENSOR: BF16/F32 GEMM > 32 rows, batched MessageGate
-    // <= 2560 hidden, bucketed 128-expert NVFP4/MXFP8 MoE, chunk-invariant tiled D=128 SWA/global attention). M5 Max,
-    // 3 interleaved rounds: 663-5,701 tok prefill +712 to +811% (38 tok +73%); 192 step rows: 0 flips, mean KL 9.58e-4.
-    {"ink2_tensor_fast", Knob::kInk2TensorFast, ModelClass::kOther, DefaultScope::kMatrix, nullptr, "on", 712, 811,
-     false, "M5 Max; fast profile only", true},
-    // Fast profile only (docs/profiles.md): Inkling-2-Mini Q8_0 dense MV (qkvrsg, wo_ud, unembed at M <= 8;
+    // Fast profile only (docs/profiles.md): Inkling-2-Mini prefill GEMMs (BF16 dense + grouped NVFP4/MXFP8 MoE) and
+    // FlashAttention on Apple10+ matrix units (src/kernels/tensor/ink2_t.metal, src/kernels/tensor/qattn_t_ink2.metal,
+    // NI_INK2_TENSOR / NI_INK2_ATTN_T). Mac mini M6, chunk 512, interleaved: 512 tok 70.4 -> 493.7/495.3 tok/s
+    // (+603%), 2048 tok 67.4 -> 382.6 tok/s (+468%); 8-window logit_dump against precise: step passes --reorder
+    // (2 near-tie flips / 192, mean KL 1.03e-3), prefill 0 flips / 8 (mean KL 3.60e-3).
+    {"ink2_tensor_pf", Knob::kInk2TensorPf, ModelClass::kOther, DefaultScope::kMatrix, nullptr, "on", 468, 603, false,
+     "Mac mini M6; fast profile only", true},
+    // Fast profile only (docs/profiles.md): Inkling-2-Mini Q8_0 dense MV (qkvrsg, wo_ud, unembed at M <= 16;
     // NI_INK2_Q8_DENSE / NI_INK2_Q8_HEAD). M5 Max, bench_kapitsa_ink2: 62.62 -> 64.77 tok/s (+3.4%, explain +8.5%);
     // 192 step rows vs precise: 0 top-1 flips (1.0000), mean KL 1.623e-3.
     {"ink2_q8_dense_fast", Knob::kInk2Q8DenseFast, ModelClass::kOther, DefaultScope::kMatrix, nullptr, "on", 3, 0,

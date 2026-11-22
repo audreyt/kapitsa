@@ -567,6 +567,12 @@ Engine::Engine(const EngineOptions& o) : opts_(o) {
     think_space_[size_t(id)] =
         !b.empty() && !tok_.is_special(id) && b.find_first_not_of(" \t\r\n") == std::string::npos;
   }
+  if (ink2_) {
+    // Inkling-2 replies open with <|message_model|> before <|content_thinking|> (or <|content_text|>);
+    // keep ThinkControl waiting in kPre across that role token so thinking_control / budget_tokens applies.
+    const int model_tok = tok_.find("<|message_model|>");
+    if (model_tok >= 0 && size_t(model_tok) < think_space_.size()) think_space_[size_t(model_tok)] = 1;
+  }
   if (nh_) {
     // Nemotron Nano 9B v2: its tokenizer has no <think> or tool-call tokens (the tags are text; its calls
     // <TOOLCALL>[{"name": ..., "arguments": ...}]</TOOLCALL>), and its template switches thinking with "/think" /
@@ -1720,10 +1726,9 @@ void Engine::verify_masks(const GrammarMatcher& gm, const GrammarState& at, Seq&
 
 void Engine::member_masks(const BatchJob& j, int P, int rows) {
   Seq& s = *j.slot->seq;
-  if (j.gm && *j.g_on) verify_masks(*j.gm, *j.gst, s, P, rows, nullptr, rows);
-  else if (j.tc && j.tc->armed())
-    j.tc->fill(s.mask.as<uint32_t>(), size_t(s.mask_words), s.tokens(), P, rows, nullptr, rows);
-  else memset(s.mask.ptr(), 0xff, size_t(rows) * size_t(s.mask_words) * 4);
+  think_member_masks(
+      j.gm && *j.g_on, [&] { verify_masks(*j.gm, *j.gst, s, P, rows, nullptr, rows); }, j.tc, s.mask.as<uint32_t>(),
+      size_t(s.mask_words), s.tokens(), P, rows);
 }
 
 // ---- batched decode ----
@@ -2456,6 +2461,8 @@ Ink2Effort resolve_inkling2_effort(const ChatRequest& r) {
     if (it == effort_map.end()) throw std::runtime_error("Unknown reasoning_effort: " + raw);
     return {key, it->second};
   };
+  // Explicit thinking_control.hard_cap == 0 outranks an explicit reasoning_effort, while thinking_budget == 0 still ranks below it.
+  if (r.think_cap == 0) return {"none", "0"};
   if (r.template_kwargs.contains("reasoning_effort") && !r.template_kwargs["reasoning_effort"].is_null()) {
     const ojson& re = r.template_kwargs["reasoning_effort"];
     if (re.is_string()) return apply_str(re.get<std::string>());
@@ -2463,7 +2470,7 @@ Ink2Effort resolve_inkling2_effort(const ChatRequest& r) {
     throw std::runtime_error("reasoning_effort must be a string or number");
   }
   if (!r.effort.empty()) return apply_str(r.effort);
-  if (r.thinking_budget == 0 || r.think_cap == 0) return {"none", "0"};
+  if (r.thinking_budget == 0) return {"none", "0"};
   if (r.template_kwargs.contains("enable_thinking") && r.template_kwargs["enable_thinking"].is_boolean() &&
       !r.template_kwargs["enable_thinking"].get<bool>())
     return {"none", "0"};
@@ -3089,10 +3096,11 @@ ChatResult Engine::chat(const ChatRequest& r_in, const std::function<bool(const 
   std::unique_ptr<GrammarMatcher> gm;
   if (r.grammar) {
     std::string why;
-    if (ink2_)
-      why = "structured output grammar is not supported with Inkling-2 yet";
-    else if (grammar_calls(*r.grammar) && (tc_open_ < 0 || tc_close_ < 0))
+    if (grammar_calls(*r.grammar) && (tc_open_ < 0 || tc_close_ < 0))
       why = "this model has no <tool_call> / </tool_call> tokens: its replies cannot be held to tool calls";
+    else if (grammar_calls(*r.grammar) && ink2_)
+      why = "Inkling-2 writes its tool calls in its own JSON markup, which the tool-call grammar does not hold yet: "
+            "send tool_choice \"auto\" and non-strict tools";
     else if (grammar_calls(*r.grammar) && (flint_ || hy4_))
       why = std::string(flint_ ? "Flint" : "Hy4-flash") +
             " writes its tool calls in GLM's markup, which the tool-call grammar does not hold yet: send "
@@ -3455,7 +3463,10 @@ ChatResult Engine::chat(const ChatRequest& r_in, const std::function<bool(const 
     const ojson& kw = r.template_kwargs;
     const bool think_off =
         kw.contains("enable_thinking") && kw["enable_thinking"].is_boolean() && !kw["enable_thinking"].get<bool>();
-    if (cap >= 0 && think_close_ >= 0 && !clover_own && (!think_off || think)) {
+    // Inkling-2's "Thinking effort level: 0" is a prompt hint rather than a closed think tag, so a requested cap
+    // still arms in kPre there (disarming at <|content_text|> if the model skips thinking, or enforcing the cap if
+    // it still opens <|content_thinking|>).
+    if (cap >= 0 && think_close_ >= 0 && !clover_own && (!think_off || think || ink2_)) {
       std::vector<int> forced = r.think_close_text.empty() ? std::vector<int>() : tok_.encode(r.think_close_text);
       forced.push_back(think_close_);  // (ThinkControl::start shortens it to fit the cap, think_close_for)
       const bool on_call = r.think_end_on_tool_call >= 0 ? r.think_end_on_tool_call > 0 : !r.tools.empty();
@@ -3464,8 +3475,11 @@ ChatResult Engine::chat(const ChatRequest& r_in, const std::function<bool(const 
         s.mask_words = (std::max(model_->vocab(), tok_.vocab_size()) + 31) / 32;
         s.mask = g.alloc(size_t(kf::kMaxRows) * size_t(s.mask_words) * 4, "grammar_mask");
       }
-      if (think && tc.near(1)) {  // a cap of 0: the prompt's last chunk samples the first token, </think> (or the text)
-        tc.fill(s.mask.as<uint32_t>(), size_t(s.mask_words), s.tokens(), 0, 1, nullptr, 1);
+      // a cap of 0: on any model whose template leaves `<think>` to the model, the prompt's last chunk masks token 0
+      // (`</think>` when already in_think, or forbidding `open` in kPre so the model cannot open reasoning on token 0),
+      // unless a row-0 structured-output grammar already owns `s.mask` (`gm && g_on`)
+      if (!(gm && g_on) && tc.near(1) &&
+          tc.fill(s.mask.as<uint32_t>(), size_t(s.mask_words), s.tokens(), 0, 1, nullptr, 1) > 0) {
         s.mask_rows = 1;
         s.mask_event = nullptr;
       }
@@ -4081,15 +4095,14 @@ ChatResult Engine::chat(const ChatRequest& r_in, const std::function<bool(const 
   };
   // ... and its thinking budget's, the same rows: those past the cap force the close
   auto tc_masks = [&](int P, int rows, bool tree) {
-    const int* t = tree ? dfl_->tree_desc() : nullptr;
-    return tc.fill(s.mask.as<uint32_t>(), size_t(s.mask_words), s.tokens(), P, rows, t ? t + kf::kPar : nullptr,
-                   t ? std::clamp(t[kf::kN], 1, rows) : rows);
+    return tc.fill_cycle(s.mask.as<uint32_t>(), size_t(s.mask_words), s.tokens(), P, rows,
+                         tree ? dfl_->tree_desc() : nullptr);
   };
   // Thinking budget: DFlash2 cycles (KFlash trees and chains) and the constrained loop mask their rows near the cap.
   // The other loops (LiLiCorr, Dory, n-gram, MTP, plain steps) hand over to the constrained loop in time: the rest of
   // the reply is plain steps there, slower but exact.
   const bool dfl_loop = !clover_own && !g_direct && !lili_ && dfl_ && !full_steps;
-  if (tc.on() && !g_direct && !dfl_loop) tc_rows = spec_loop ? kf::kMaxRows + 1 : 2;
+  if (tc.on() && !g_direct && !dfl_loop) tc_rows = think_handover_rows(spec_loop);
   // (a cap that close: the constrained loop from the first token, as the hand-over could come too late)
   const bool tc_direct = tc_rows > 0 && tc.near(tc_rows);  // (near: from the first forced position, think_close_for)
   if (tc_direct) tc_rows = 0;
@@ -5051,7 +5064,8 @@ ChatResult Engine::chat(const ChatRequest& r_in, const std::function<bool(const 
         }
         ink2_->encode_step(*e2, s, P, sp, uint32_t(P), true);
         e2->commit_and_wait();
-        const float cyc_ms = float(now_ms() - t_cyc0);
+        const float gpu_dt = float(e2->gpu_ms());
+        const float cyc_ms = (gpu_dt > 0.1f && gpu_dt < 500.0f) ? gpu_dt : float(now_ms() - t_cyc0);
         if (cyc_ms > 0.1f && cyc_ms < 500.0f) step_ms = 0.92f * step_ms + 0.08f * cyc_ms;
         ++plain_streak;
         update_chan(s.tokens()[P + 1]);
@@ -5086,7 +5100,8 @@ ChatResult Engine::chat(const ChatRequest& r_in, const std::function<bool(const 
         ink2_->encode_mtp_draft_tree(*e2, s, P, R_tree, sp);
         ink2_->encode_mtp_verify_tree(*e2, s, P, R_tree, sp, uint32_t(P));
         e2->commit_and_wait();
-        const float cyc_ms = float(now_ms() - t_cyc0);
+        const float gpu_dt = float(e2->gpu_ms());
+        const float cyc_ms = (gpu_dt > 0.1f && gpu_dt < 500.0f) ? gpu_dt : float(now_ms() - t_cyc0);
         const int cur_chan = chan;
         const int m_ret = ink2_->accept_mtp_tree(s, P, sp, uint32_t(P), pend_path);
         if (best_tree_idx >= 0) {
@@ -5150,7 +5165,8 @@ ChatResult Engine::chat(const ChatRequest& r_in, const std::function<bool(const 
       if (!use_suffix) ink2_->encode_mtp_draft(*e2, s, P, K, sp, uint32_t(P));
       ink2_->encode_mtp_verify(*e2, s, P, K + 1, sp, uint32_t(P), use_suffix);
       e2->commit_and_wait();
-      const float cyc_ms = float(now_ms() - t_cyc0);
+      const float gpu_dt = float(e2->gpu_ms());
+      const float cyc_ms = (gpu_dt > 0.1f && gpu_dt < 500.0f) ? gpu_dt : float(now_ms() - t_cyc0);
       const int a = ink2_->accept_mtp(s, P, K, sp, uint32_t(P), use_suffix);
       if (cyc_ms > 0.1f && cyc_ms < 500.0f && K >= 1) {
         const float obs_row =

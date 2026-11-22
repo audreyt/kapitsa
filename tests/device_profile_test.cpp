@@ -84,16 +84,7 @@ int main() {
   CHECK(ni::default_matches(*wave, faked));
   CHECK(ni::default_matches(*hist, faked));
 
-  CHECK(ni::default_count() == 22);  // +1: 9B mixed-format catalog policy (#493); +1: kflash_block16; +1: ane_proj_fast; +1: a4_qtm_fast; +1: ink2_tensor_fast; +1: ink2_q8_dense_fast
-  {
-    const auto* ink2t = row("ink2_tensor_fast");
-    const ni::ModelFacts any;
-    CHECK(ink2t && ink2t->knob == ni::Knob::kInk2TensorFast && ink2t->scope == ni::DefaultScope::kMatrix &&
-          !ink2t->exclusive && ink2t->live);
-    CHECK(ni::default_on(ni::Knob::kInk2TensorFast, m5max, any) && ni::default_on(ni::Knob::kInk2TensorFast, m5pro, any));
-    CHECK(!ni::default_on(ni::Knob::kInk2TensorFast, ni::resolve_device(mac(9, 20, "Apple M4 Pro", g48)), any));
-    CHECK(!ni::default_on(ni::Knob::kInk2TensorFast, ni::resolve_device(mac(7, 8, "Apple M1", 16L << 30)), any));
-  }
+  CHECK(ni::default_count() == 22);  // +1: 9B mixed-format catalog policy (#493); +1: kflash_block16; +1: ane_proj_fast; +1: a4_qtm_fast; +1: ink2_tensor_pf; +1: ink2_q8_dense_fast
   {
     const auto* q8d = row("ink2_q8_dense_fast");
     const ni::ModelFacts any;
@@ -189,6 +180,12 @@ int main() {
         a4q->win_pct == 56 && a4q->live);
   CHECK(ni::default_matches(*a4q, m5pro) && ni::default_matches(*a4q, m5max));
   CHECK(!ni::default_matches(*a4q, ni::resolve_device(mac(9, 20, "Apple M4 Pro", g48))));
+  // ink2_tensor_pf: Inkling-2-Mini prefill GEMMs on the matrix units, fast profile only; the matrix class
+  const ni::DefaultRow* ink2t = row("ink2_tensor_pf");
+  CHECK(ink2t && ink2t->knob == ni::Knob::kInk2TensorPf && ink2t->scope == ni::DefaultScope::kMatrix &&
+        !ink2t->exclusive && ink2t->win_pct == 468 && ink2t->live);
+  CHECK(ni::default_matches(*ink2t, m5pro) && ni::default_matches(*ink2t, m5max));
+  CHECK(!ni::default_matches(*ink2t, ni::resolve_device(mac(9, 20, "Apple M4 Pro", g48))));
   const ni::DefaultRow* slices = row("gemm_slices");
   const ni::DefaultRow* hc = row("hc_wide");
   const ni::DefaultRow* moe = row("moe4_dx");

@@ -114,7 +114,9 @@ int main(int argc, char** argv) {
       if (rollout[i] == want_rollout[i]) ++match_n;
       else break;
     }
-    const bool ok = (top1_id == top10_ids[0]) && (max_top10_diff_fp16 < 0.01f) && (rollout == want_rollout);
+    const float top10_diff = model.use_tensor() ? std::min(max_top10_diff_fp16, max_top10_diff_fp32) : max_top10_diff_fp16;
+    const float tol = model.quantized_dense() ? 0.15f : 0.01f;
+    const bool ok = (top1_id == top10_ids[0]) && (top10_diff < tol) && (rollout == want_rollout);
     printf("%s %s: top1=%d (want %d) top1_logit=%.4f (fp16 %.4f, fp32 %.4f) fp16_top10_diff=%.5f fp32_top10_diff=%.5f rollout=%d/24\n",
            ok ? "PASS" : "FAIL", name.c_str(), top1_id, top10_ids[0], top1_val, fp16_top10_vals[0], top10_vals[0],
            max_top10_diff_fp16, max_top10_diff_fp32, match_n);

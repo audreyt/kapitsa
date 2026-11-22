@@ -29,6 +29,7 @@ PAGES = [
     "docs/benchmarks-m5-max.md",
     "docs/benchmarks.md",
     "docs/control-socket.md",
+    "docs/inkling2-dspark.md",
     "docs/kflash-map.md",
     "docs/kflash.md",
     "docs/numerical-history.md",

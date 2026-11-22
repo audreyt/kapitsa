@@ -26,6 +26,8 @@
 
 namespace ni {
 
+extern const char* const kTensorKernelSource;
+
 using json = nlohmann::json;
 
 namespace {
@@ -50,26 +52,12 @@ Pipeline ink2_pipe(const std::string& name) {
   return cache.emplace(name, p).first->second;
 }
 
-Pipeline ink2_tpipe(const std::string& name) {
-  static std::mutex mu;
-  static std::unordered_map<std::string, Pipeline> cache;
-  {
-    std::lock_guard<std::mutex> lk(mu);
-    auto it = cache.find(name);
-    if (it != cache.end()) return it->second;
+static bool ink2_tensor_pf_want() {
+  if (__builtin_available(macOS 26.0, *)) {
+    const bool here = default_on(Knob::kInk2TensorPf, ModelFacts{});
+    return profile_switch("NI_INK2_TENSOR", here, "Inkling-2-Mini prefill GEMMs on the matrix units (NI_INK2_TENSOR)");
   }
-  const Pipeline p = ink2::tensor_pipeline(name);
-  std::lock_guard<std::mutex> lk(mu);
-  return cache.emplace(name, p).first->second;
-}
-
-bool want_ink2_tensor() {
-  static const bool on = [] {
-    bool here = false;
-    if (__builtin_available(macOS 26.0, *)) here = default_on(Knob::kInk2TensorFast, ModelFacts{});
-    return profile_switch("NI_INK2_TENSOR", here, "Inkling-2 prefill on the matrix units (NI_INK2_TENSOR)");
-  }();
-  return on;
+  return false;
 }
 
 bool want_ink2_q8_dense() {
@@ -86,30 +74,6 @@ bool want_ink2_kv_fp8() {
     return v && *v && atoi(v) != 0;
   }();
   return on;
-}
-
-bool init_tensor_kernels() {
-  static std::mutex mu;
-  std::lock_guard<std::mutex> lk(mu);
-  Gpu::PipelineRecovery rec;
-  try {
-    ink2::compile_tensor_kernels();
-    static const char* const kTensorNames[] = {
-        "ink2_bf16_mm_t",     "ink2_msg_gate_prep",    "ink2_msg_gate_mix",    "ink2_moe_bucket",
-        "ink2_moe_nvfp4_w13_t","ink2_moe_nvfp4_w2_t",  "ink2_moe_mxfp8_w13_t", "ink2_moe_mxfp8_w2_t",
-        "ink2_moe_reduce8",   "ink2_attn_prefill_t",
-    };
-    for (const char* name : kTensorNames) {
-      if (!ink2::tensor_pipeline(name, /*required=*/false).pso) {
-        logi("Inkling2: Metal 4 tensor kernel %s unavailable; falling back to Metal 3", name);
-        return false;
-      }
-    }
-    return true;
-  } catch (const std::exception& ex) {
-    logi("Inkling2: Metal 4 tensor kernels unavailable (%s); falling back to Metal 3", ex.what());
-    return false;
-  }
 }
 
 Pipeline base_pipe(const std::string& name) {
@@ -136,13 +100,14 @@ struct Ink2Grouped {
   }
 };
 
-void prewarm_pipelines() {
+void prewarm_pipelines(bool tensor_pf) {
   if (const char* v = getenv("NI_PREWARM"); v && !strcmp(v, "0")) return;
   static const char* const kInk2Names[] = {
       "ink2_copy_bytes",       "ink2_bf16_mv",           "ink2_bf16_mv4",         "ink2_bf16_mv4_multi6",
       "ink2_bf16_mv8",         "ink2_bf16_mv8_multi6",   "ink2_bf16_mv_smalln",   "ink2_bf16_mm",
       "ink2_rmsnorm",          "ink2_rmsnorm3",          "ink2_attn_res",         "ink2_attn_res_pass",
-      "ink2_msg_gate",         "ink2_msg_gate_prep_s",   "ink2_msg_gate_prep3_s", "ink2_msg_gate_down_s",
+      "ink2_msg_gate",         "ink2_msg_gate_prep",     "ink2_msg_gate_mix",
+      "ink2_msg_gate_prep_s",  "ink2_msg_gate_prep3_s",  "ink2_msg_gate_down_s",
       "ink2_msg_gate_down3_s", "ink2_msg_gate_up_mix_s", "ink2_msg_gate_up_mix3_s","ink2_msg_gate_up_mix_norm_s",
       "ink2_embed_norm",       "ink2_sconv_static",      "ink2_sconv_static_pf",  "ink2_sconv_dynamic",    "ink2_qkvr_prep",         "ink2_rel_bias",         "ink2_rel_bias_pf",
       "ink2_attn_decode",      "ink2_attn_decode_reduce","ink2_attn_decode_1pass","ink2_attn_verify",      "ink2_attn_verify2",     "ink2_attn_verify_reduce","ink2_attn_prefill",     "ink2_moe_route",
@@ -154,8 +119,20 @@ void prewarm_pipelines() {
       "ink2_q8_mv4_multi6",    "ink2_q8_mv8_multi6",     "ink2_quant_q4g64_bf16", "ink2_q4g64_mv4",
       "ink2_q4g64_mv8",        "ink2_sconv_static_tree", "ink2_sconv_dynamic_tree","ink2_qkvr_prep_tree",
       "ink2_attn_verify_tree_gqa", "ink2_kv_compact",    "ink2_gather_rows",
+      "ink2_moe_bucket",       "ink2_moe_situ_half",     "ink2_moe_combine",
   };
   for (const char* n : kInk2Names) (void)ink2_pipe(n);
+  if (tensor_pf) {
+    static const char* const kTensorNames[] = {
+        "ink2_t_bf16_m64",
+        "ink2_t_nvfp4_moe_w13_m16", "ink2_t_nvfp4_moe_w13_m32", "ink2_t_nvfp4_moe_w13_m64",
+        "ink2_t_nvfp4_moe_w2_m16",  "ink2_t_nvfp4_moe_w2_m32",  "ink2_t_nvfp4_moe_w2_m64",
+        "ink2_t_mxfp8_moe_w13_m16", "ink2_t_mxfp8_moe_w13_m32", "ink2_t_mxfp8_moe_w13_m64",
+        "ink2_t_mxfp8_moe_w2_m16",  "ink2_t_mxfp8_moe_w2_m32",  "ink2_t_mxfp8_moe_w2_m64",
+        "qattn_ink2_s6k32p",        "qattn_ink2_s3k16",
+    };
+    for (const char* n : kTensorNames) (void)base_pipe(n);
+  }
   (void)base_pipe("topk_stage1");
   (void)base_pipe("sample_stage2");
 }
@@ -254,6 +231,22 @@ struct Ink2KvCompactP {
 struct Ink2GatherP {
   uint32_t m, H;
   uint32_t path[16];
+};
+struct Ink2BucketP {
+  uint32_t P, E, BM;
+};
+struct Ink2SituP {
+  uint32_t n;
+};
+struct Ink2CombineP {
+  uint32_t T, H, K_top;
+};
+struct Ink2tGemmP {
+  uint32_t M, N, K;
+  uint32_t x_ld, y_ld;
+  uint32_t add;
+  uint32_t q_estride, s_estride;
+  uint32_t k;
 };
 
 const json& text_cfg(const json& root) { return root.contains("text_config") ? root["text_config"] : root; }
@@ -491,6 +484,11 @@ MemPlan Inkling2::plan(const std::string& dir, int prefill_chunk) {
                        size_t(c.num_layers) * 2 * size_t(c.n_experts) * 4 +
                        size_t(c.hq) * kMaxAttnChunks * (2 + size_t(c.head_dim)) * 4 + V * 4 +
                        2 * (V / 2048 + 2) * 64 * 4 + 2 * 64 * 4;
+  const size_t P = T * size_t(c.top_k);
+  const size_t moe_tmp_bytes = ink2_tensor_pf_want()
+                                   ? (P * std::max(H, size_t(2) * size_t(c.moe_I)) * 4 + P * size_t(c.moe_I) * 2 +
+                                      2 * P * 4 + (P / 16 + size_t(c.n_experts) + 2) * 16 + 16)
+                                   : 0;
   MemPlan m;
   m.weights = safetensors_llm_bytes(dir);
   m.kv_per_pos = kv_per_pos(c);
@@ -504,7 +502,7 @@ MemPlan Inkling2::plan(const std::string& dir, int prefill_chunk) {
     m.kv_per_pos += Ink2Mtp::kv_per_pos(mc);
     m.slot_state += 3 * Ink2Mtp::ring_bytes_per_seq(mc, rcap);
   }
-  size_t act = T * per_row + fixed + (16u << 20);
+  size_t act = T * per_row + fixed + moe_tmp_bytes + (16u << 20);
   if (has_mtp) {
     const size_t B = size_t(std::max(1, mc.block));
     const size_t MQD = size_t(mc.hq) * size_t(mc.head_dim);
@@ -529,8 +527,13 @@ Inkling2::Inkling2(const std::string& path, int prefill_chunk) {
   tmax_ = std::max(8, prefill_chunk > 0 ? prefill_chunk : 512);
   ring_rows_ = (cfg_.swa + tmax_ + 15) / 16 * 16;
   ink2::compile_kernels();
-  prewarm_pipelines();
-  use_tensor_ = want_ink2_tensor() && init_tensor_kernels();
+  if (ink2_tensor_pf_want()) {
+    if (__builtin_available(macOS 26.0, *)) {
+      Gpu::get().compile_extra("tensor", kTensorKernelSource, true);
+      tensor_pf_ = Gpu::get().pipeline("ink2_t_bf16_m64", false).pso != nullptr;
+    }
+  }
+  prewarm_pipelines(tensor_pf_);
   use_q8_dense_ = want_ink2_q8_dense() && (cfg_.hidden & 255) == 0 && ((cfg_.hq * cfg_.head_dim) & 255) == 0;
   use_kv_fp8_ = want_ink2_kv_fp8();
   if (const char* q4e = getenv("NI_INK2_Q4_HEAD"); q4e && *q4e) {
@@ -548,11 +551,14 @@ Inkling2::Inkling2(const std::string& path, int prefill_chunk) {
 
 void Inkling2::set_use_tensor(bool on) {
   if (!on) {
-    use_tensor_ = false;
+    tensor_pf_ = false;
     return;
   }
-  if (!moe_pair_out_) fatal("inkling2: tensor buffers not allocated (restart with KAPITSA_PROFILE=fast or NI_INK2_TENSOR=1)");
-  use_tensor_ = init_tensor_kernels();
+  if (!moe_tmp_) fatal("inkling2: tensor buffers not allocated (restart with KAPITSA_PROFILE=fast or NI_INK2_TENSOR=1)");
+  if (__builtin_available(macOS 26.0, *)) {
+    Gpu::get().compile_extra("tensor", kTensorKernelSource, true);
+    tensor_pf_ = Gpu::get().pipeline("ink2_t_bf16_m64", false).pso != nullptr;
+  }
 }
 
 int Inkling2::mtp_block() const { return mtp_ ? mtp_->block() : 1; }
@@ -844,16 +850,24 @@ void Inkling2::alloc_buffers() {
   msg_out_ = alloc(4 * T * H * 4, "ink2_msg");
   const size_t ncore = size_t(cfg_.core_end - cfg_.core_start);
   pass_msg_out_ = alloc(ncore * 4 * 16 * H * 4, "ink2_pass_msg");
-  mg_cat_ = alloc(std::max<size_t>(use_tensor_ ? T : 0, 3 * 16) * 2 * H * 4, "ink2_mg_cat");
-  mg_lat_ = alloc(std::max<size_t>(use_tensor_ ? T : 0, 3 * 16) * size_t(cfg_.gate_rank) * 4, "ink2_mg_lat");
-  if (use_tensor_) {
+  mg_cat_ = alloc(std::max<size_t>(tensor_pf_ ? T : 0, 3 * 16) * 2 * H * 4, "ink2_mg_cat");
+  mg_lat_ = alloc(std::max<size_t>(tensor_pf_ ? T : 0, 3 * 16) * size_t(cfg_.gate_rank) * 4, "ink2_mg_lat");
+  if (tensor_pf_) {
     mg_f_ = alloc(T * H * 4, "ink2_mg_f");
     mg_g_ = alloc(T * H * 4, "ink2_mg_g");
+    const size_t P = T * size_t(cfg_.top_k);
+    moe_sorted_ = alloc(P * 4, "ink2_moe_sorted");
+    moe_rank_ = alloc(P * 4, "ink2_moe_rank");
+    moe_tmp_ = alloc(P * std::max(H, size_t(2) * size_t(cfg_.moe_I)) * 4, "ink2_moe_tmp");
+    moe_act_h_ = alloc(P * size_t(cfg_.moe_I) * 2, "ink2_moe_act_h");
   }
   {
-    const size_t r_max = std::max<size_t>(use_tensor_ ? T : 31, 31) * size_t(cfg_.top_k);
-    const size_t max_tiles = std::max<size_t>((r_max + 31) / 32 + size_t(cfg_.n_experts) + 4, size_t(cfg_.n_experts) + 4);
-    moe_tiles_ = alloc(max_tiles * 3 * 4, "ink2_moe_tiles");
+    const size_t P = T * size_t(cfg_.top_k);
+    const size_t r_max = 31u * size_t(cfg_.top_k);
+    const size_t small_tiles = std::max<size_t>((r_max + 31) / 32 + size_t(cfg_.n_experts) + 4, size_t(cfg_.n_experts) + 4);
+    const size_t tile_bytes = tensor_pf_ ? std::max((P / 16 + size_t(cfg_.n_experts) + 4) * 16, small_tiles * 3 * 4)
+                                         : (small_tiles * 3 * 4);
+    moe_tiles_ = alloc(tile_bytes, "ink2_moe_tiles");
     moe_ntiles_ = alloc(16, "ink2_moe_ntiles");
     moe_st_tok_ = alloc(r_max * 4, "ink2_moe_st_tok");
     moe_st_pair_ = alloc(r_max * 4, "ink2_moe_st_pair");
@@ -1144,15 +1158,27 @@ void Inkling2::enc_mm(Encoder& e, const Tensor& w, const Buffer& x, const Buffer
         e.dispatch((N + 3) / 4, 1, 1, 128);
       }
     }
+  } else if (tensor_pf_ && w.dtype == DType::BF16 && K % 32 == 0) {
+    const Ink2tGemmP p{uint32_t(M), N, K, K, N, add ? 1u : 0u, 0u, 0u, 0u};
+    e.use(base_pipe("ink2_t_bf16_m64"));
+    e.buf(0, x);
+    e.buf(1, w.buf);
+    e.buf(2, w.buf);
+    e.buf(3, y);
+    e.val(4, p);
+    e.buf(5, moe_tiles_);
+    e.buf(6, moe_ntiles_);
+    e.buf(7, moe_sorted_);
+    e.buf(8, x);
+    e.dispatch((N + 63) / 64, (uint32_t(M) + 63) / 64, 1, 128);
   } else {
     const Ink2MmP p{uint32_t(M), N, K, K, N, w.dtype == DType::F32 ? 1u : 0u, add ? 1u : 0u};
-    const bool t = use_tensor_;
-    e.use(t ? ink2_tpipe("ink2_bf16_mm_t") : ink2_pipe("ink2_bf16_mm"));
+    e.use(ink2_pipe("ink2_bf16_mm"));
     e.buf(0, x);
     e.buf(1, w.buf);
     e.buf(2, y);
     e.val(3, p);
-    e.dispatch((N + 63) / 64, (uint32_t(M) + (t ? 63u : 31u)) / (t ? 64u : 32u), 1, 128);
+    e.dispatch((N + 63) / 64, (uint32_t(M) + 31) / 32, 1, 128);
   }
 }
 
@@ -1187,10 +1213,10 @@ void Inkling2::enc_attn_res(Encoder& e, const Buffer* const* states, int M, cons
 }
 
 void Inkling2::enc_msg_gate(Encoder& e, const Ink2Ctrl& c, const Buffer& h, const Buffer& m, const Buffer& out, int T) {
-  if (use_tensor_ && T >= 32 && cfg_.hidden <= 2560 && (cfg_.hidden & 3) == 0) {
+  if (tensor_pf_ && T >= 32 && cfg_.hidden <= 2560 && (cfg_.hidden & 3) == 0) {
     const uint32_t H = uint32_t(cfg_.hidden);
     const struct { uint32_t T, H; float eps; } pp{uint32_t(T), H, cfg_.rms_eps};
-    e.use(ink2_tpipe("ink2_msg_gate_prep"));
+    e.use(ink2_pipe("ink2_msg_gate_prep"));
     e.buf(0, h);
     e.buf(1, m);
     e.buf(2, mg_cat_);
@@ -1203,7 +1229,7 @@ void Inkling2::enc_msg_gate(Encoder& e, const Ink2Ctrl& c, const Buffer& h, cons
     e.group_end();
     const uint32_t n = uint32_t(T) * H;
     const struct { uint32_t n; } mp{n};
-    e.use(ink2_tpipe("ink2_msg_gate_mix"));
+    e.use(ink2_pipe("ink2_msg_gate_mix"));
     e.buf(0, h);
     e.buf(1, m);
     e.buf(2, mg_f_);
@@ -1273,7 +1299,7 @@ void Inkling2::enc_msg_gate3(Encoder& e, const Ink2Layer& L, const Buffer* const
     e.dispatch((H + 63) / 64, (uint32_t(T) + 7) / 8, 3, 64);
     return;
   }
-  const bool batched_mg = use_tensor_ && T >= 32 && cfg_.hidden <= 2560 && (cfg_.hidden & 3) == 0;
+  const bool batched_mg = tensor_pf_ && T >= 32 && cfg_.hidden <= 2560 && (cfg_.hidden & 3) == 0;
   if (!batched_mg) e.group_begin();
   for (int i = 0; i < 3; ++i) enc_msg_gate(e, *cs[i], *in_ptrs[i], *ms[i], *outs[i], T);
   if (!batched_mg) e.group_end();
@@ -1427,7 +1453,6 @@ void Inkling2::enc_forward(Encoder& e, Seq& s, int pos0, int T, bool dump_logits
       const Buffer qv = msg_queries_.view(size_t(ip - cfg_.core_start) * 4 * H * 4, 4 * H * 4);
       enc_attn_res(e, bank_states, 2, &qv, true, 4, msg_out_, T);
     }
-
     // Attention input AttnRes (*cur_x stays untouched until end-of-visit ping-pong write)
     const Buffer ar0 = ar_out_.view(0 * row_bytes, row_bytes);
     const Buffer ar1 = ar_out_.view(1 * row_bytes, row_bytes);
@@ -1816,18 +1841,34 @@ void Inkling2::enc_forward(Encoder& e, Seq& s, int pos0, int T, bool dump_logits
                             uint32_t(cfg_.swa),
                             attn_scale,
                             kv_fp8_flag};
-      const bool attn_t = use_tensor_ && T >= 32 && cfg_.head_dim == 128;
-      e.use(attn_t ? ink2_tpipe("ink2_attn_prefill_t") : ink2_pipe("ink2_attn_prefill"));
-      e.buf(0, q_);
-      e.buf(1, s.kc[v_idx]);
-      e.buf(2, s.vc[v_idx]);
-      e.buf(3, rb_);
-      e.buf(4, sinks_);
-      e.buf(5, gate_attn_);
-      e.buf(6, att_out_);
-      e.val(7, apf);
-      if (attn_t) e.dispatch((uint32_t(T) + 15) / 16, uint32_t(cfg_.hq), 1, 128);
-      else e.dispatch(uint32_t(cfg_.hq), uint32_t(T), 1, 128);
+      static const bool qat_env = !getenv("NI_INK2_ATTN_T") || atoi(getenv("NI_INK2_ATTN_T")) != 0;
+      static const bool qat_small = getenv("MTL_SHADER_VALIDATION") && atoi(getenv("MTL_SHADER_VALIDATION")) != 0;
+      const bool use_qat =
+          qat_env && !use_kv_fp8_ && tensor_pf_ && T >= 16 && cfg_.head_dim == 128 && cfg_.hq == cfg_.hkv * 3;
+      if (use_qat) {
+        const uint32_t qat_tok = qat_small ? 16u : 32u;
+        e.use(base_pipe(qat_small ? "qattn_ink2_s3k16" : "qattn_ink2_s6k32p"));
+        e.buf(0, q_);
+        e.buf(1, s.kc[v_idx]);
+        e.buf(2, s.vc[v_idx]);
+        e.buf(3, rb_);
+        e.buf(4, sinks_);
+        e.buf(5, gate_attn_);
+        e.buf(6, att_out_);
+        e.val(7, apf);
+        e.dispatch((uint32_t(T) + qat_tok - 1) / qat_tok, uint32_t(cfg_.hkv), 1, qat_small ? 96 : 192);
+      } else {
+        e.use(ink2_pipe("ink2_attn_prefill"));
+        e.buf(0, q_);
+        e.buf(1, s.kc[v_idx]);
+        e.buf(2, s.vc[v_idx]);
+        e.buf(3, rb_);
+        e.buf(4, sinks_);
+        e.buf(5, gate_attn_);
+        e.buf(6, att_out_);
+        e.val(7, apf);
+        e.dispatch(uint32_t(cfg_.hq), uint32_t(T), 1, 128);
+      }
     }
 
     // wo_ud + attn_sconv (+ *cur_x residual on non-boundary layers -> ffn_inp_)
@@ -1892,166 +1933,190 @@ void Inkling2::enc_forward(Encoder& e, Seq& s, int pos0, int T, bool dump_logits
       e.dispatch(uint32_t(T), 1, 1, 32);
     }
     {
-      const Ink2MoeP mp{uint32_t(T), H, uint32_t(cfg_.moe_I), uint32_t(cfg_.top_k)};
-      if (use_tensor_ && T >= 32 && cfg_.n_experts == 128) {
-        const struct { uint32_t T, K_top, E; } bp{uint32_t(T), uint32_t(cfg_.top_k), uint32_t(cfg_.n_experts)};
-        e.use(ink2_tpipe("ink2_moe_bucket"));
-        e.buf(0, eid_);
-        e.buf(1, ew_);
-        e.buf(2, moe_tiles_);
-        e.buf(3, moe_ntiles_);
-        e.buf(4, moe_st_tok_);
-        e.buf(5, moe_st_pair_);
-        e.buf(6, moe_st_ew_);
-        e.val(7, bp);
-        e.dispatch(1, 1, 1, 128);
-
-        const uint32_t max_tiles = (uint32_t(T) * uint32_t(cfg_.top_k) + 31u) / 32u + uint32_t(cfg_.n_experts);
-        int b = 0;
-        e.use(ink2_tpipe(L.is_mxfp8 ? "ink2_moe_mxfp8_w13_t" : "ink2_moe_nvfp4_w13_t"));
-        e.buf(b++, x_mlp_);
-        e.buf(b++, L.w13->buf);
-        e.buf(b++, L.w13_sc->buf);
-        if (!L.is_mxfp8) e.buf(b++, L.w13_outer);
-        e.buf(b++, moe_tiles_);
-        e.buf(b++, moe_ntiles_);
-        e.buf(b++, moe_st_tok_);
-        e.buf(b++, moe_act_);
-        e.val(b, mp);
-        e.dispatch((uint32_t(cfg_.moe_I) + 31) / 32, max_tiles, 1, 128);
-
-        b = 0;
-        e.use(ink2_tpipe(L.is_mxfp8 ? "ink2_moe_mxfp8_w2_t" : "ink2_moe_nvfp4_w2_t"));
-        e.buf(b++, moe_act_);
-        e.buf(b++, L.w2->buf);
-        e.buf(b++, L.w2_sc->buf);
-        if (!L.is_mxfp8) e.buf(b++, L.w2_outer);
-        e.buf(b++, moe_tiles_);
-        e.buf(b++, moe_ntiles_);
-        e.buf(b++, moe_st_pair_);
-        e.buf(b++, moe_st_ew_);
-        e.buf(b++, moe_pair_out_);
-        e.val(b, mp);
-        e.dispatch((H + 63) / 64, max_tiles, 1, 128);
-
-        e.use(ink2_tpipe("ink2_moe_reduce8"));
-        e.buf(0, moe_pair_out_);
-        e.buf(1, moe_out_);
-        e.val(2, mp);
-        e.dispatch(((H / 4) + 63) / 64, uint32_t(T), 1, 64);
-      } else if (T >= 2 && T <= 31 && moe_tiles_) {
-        const struct {
-          uint32_t T, K_top, E;
-        } bp{uint32_t(T), uint32_t(cfg_.top_k), uint32_t(cfg_.n_experts)};
-        e.use(ink2_pipe("ink2_moe_bucket_small"));
-        e.buf(0, eid_);
-        e.buf(1, ew_);
-        e.buf(2, moe_tiles_);
-        e.buf(3, moe_ntiles_);
-        e.buf(4, moe_st_tok_);
-        e.buf(5, moe_st_pair_);
-        e.buf(6, moe_st_ew_);
-        e.val(7, bp);
-        e.dispatch(1, 1, 1, 128);
-
-        const uint32_t max_e = std::min(uint32_t(cfg_.n_experts), uint32_t(T) * uint32_t(cfg_.top_k));
-        if (!L.is_mxfp8) {
-          e.use(ink2_pipe("ink2_moe_nvfp4_w13_g"));
+      if (tensor_pf_ && T >= 32) {
+        const uint32_t P = uint32_t(T) * uint32_t(cfg_.top_k);
+        const uint32_t E = uint32_t(cfg_.n_experts);
+        const uint32_t I = uint32_t(cfg_.moe_I);
+        const uint32_t per = P / E;
+        const uint32_t bm = per >= 40 ? 64u : per >= 12 ? 32u : 16u;
+        const std::string ms = "_m" + std::to_string(bm);
+        const uint32_t max_tiles = P / bm + E + 1;
+        {
+          const Ink2BucketP bp{P, E, bm};
+          e.use(ink2_pipe("ink2_moe_bucket"));
+          e.buf(0, eid_);
+          e.buf(1, moe_sorted_);
+          e.buf(2, moe_tiles_);
+          e.buf(3, moe_ntiles_);
+          e.buf(4, moe_rank_);
+          e.val(5, bp);
+          e.dispatch(1, 1, 1, 256);
+        }
+        const uint32_t w13_q_stride = L.is_mxfp8 ? (2 * I * H) : (2 * I * (H / 2));
+        const uint32_t w13_s_stride = L.is_mxfp8 ? (2 * I * (H / 32)) : (2 * I * (H / 16));
+        {
+          const Ink2tGemmP gp{P, 2 * I, H, H, 2 * I, 0u, w13_q_stride, w13_s_stride, uint32_t(cfg_.top_k)};
+          e.use(base_pipe((L.is_mxfp8 ? "ink2_t_mxfp8_moe_w13" : "ink2_t_nvfp4_moe_w13") + ms));
           e.buf(0, x_mlp_);
           e.buf(1, L.w13->buf);
           e.buf(2, L.w13_sc->buf);
-          e.buf(3, L.w13_outer);
-          e.buf(4, moe_tiles_);
-          e.buf(5, moe_ntiles_);
-          e.buf(6, moe_st_tok_);
-          e.buf(7, moe_st_pair_);
-          e.buf(8, moe_act_);
-          e.val(9, mp);
-          e.dispatch((uint32_t(cfg_.moe_I) + 15) / 16, max_e, 1, 128);
-
-          e.use(ink2_pipe("ink2_moe_nvfp4_w2_g"));
-          e.buf(0, moe_act_);
+          e.buf(3, moe_tmp_);
+          e.val(4, gp);
+          e.buf(5, moe_tiles_);
+          e.buf(6, moe_ntiles_);
+          e.buf(7, moe_sorted_);
+          e.buf(8, L.is_mxfp8 ? x_mlp_ : L.w13_outer);
+          e.dispatch((2 * I + 63) / 64, max_tiles, 1, 128);
+        }
+        {
+          const Ink2SituP sp{P * I};
+          e.use(ink2_pipe("ink2_moe_situ_half"));
+          e.buf(0, moe_tmp_);
+          e.buf(1, moe_act_h_);
+          e.val(2, sp);
+          e.dispatch((sp.n + 255) / 256, 1, 1, 256);
+        }
+        const uint32_t w2_q_stride = L.is_mxfp8 ? (H * I) : (H * (I / 2));
+        const uint32_t w2_s_stride = L.is_mxfp8 ? (H * (I / 32)) : (H * (I / 16));
+        {
+          const Ink2tGemmP gp{P, H, I, I, H, 0u, w2_q_stride, w2_s_stride, uint32_t(cfg_.top_k)};
+          e.use(base_pipe((L.is_mxfp8 ? "ink2_t_mxfp8_moe_w2" : "ink2_t_nvfp4_moe_w2") + ms));
+          e.buf(0, moe_act_h_);
           e.buf(1, L.w2->buf);
           e.buf(2, L.w2_sc->buf);
-          e.buf(3, L.w2_outer);
-          e.buf(4, moe_tiles_);
-          e.buf(5, moe_ntiles_);
-          e.buf(6, moe_st_pair_);
-          e.buf(7, moe_st_ew_);
-          e.buf(8, moe_pair_out_);
-          e.val(9, mp);
-          e.dispatch((H + 15) / 16, max_e, 1, 128);
-        } else {
-          e.use(ink2_pipe("ink2_moe_mxfp8_w13_g"));
-          e.buf(0, x_mlp_);
-          e.buf(1, L.w13->buf);
-          e.buf(2, L.w13_sc->buf);
-          e.buf(3, moe_tiles_);
-          e.buf(4, moe_ntiles_);
-          e.buf(5, moe_st_tok_);
-          e.buf(6, moe_st_pair_);
-          e.buf(7, moe_act_);
-          e.val(8, mp);
-          e.dispatch((uint32_t(cfg_.moe_I) + 15) / 16, max_e, 1, 128);
-
-          e.use(ink2_pipe("ink2_moe_mxfp8_w2_g"));
-          e.buf(0, moe_act_);
-          e.buf(1, L.w2->buf);
-          e.buf(2, L.w2_sc->buf);
-          e.buf(3, moe_tiles_);
-          e.buf(4, moe_ntiles_);
+          e.buf(3, moe_tmp_);
+          e.val(4, gp);
+          e.buf(5, moe_tiles_);
+          e.buf(6, moe_ntiles_);
+          e.buf(7, moe_sorted_);
+          e.buf(8, L.is_mxfp8 ? x_mlp_ : L.w2_outer);
+          e.dispatch((H + 63) / 64, max_tiles, 1, 128);
+        }
+        {
+          const Ink2CombineP cp{uint32_t(T), H, uint32_t(cfg_.top_k)};
+          e.use(ink2_pipe("ink2_moe_combine"));
+          e.buf(0, moe_tmp_);
+          e.buf(1, ew_);
+          e.buf(2, moe_out_);
+          e.val(3, cp);
+          e.dispatch(uint32_t(T), 1, 1, 256);
+        }
+      } else {
+        const Ink2MoeP mp{uint32_t(T), H, uint32_t(cfg_.moe_I), uint32_t(cfg_.top_k)};
+        if (T >= 2 && T <= 31 && moe_tiles_) {
+          const struct {
+            uint32_t T, K_top, E;
+          } bp{uint32_t(T), uint32_t(cfg_.top_k), uint32_t(cfg_.n_experts)};
+          e.use(ink2_pipe("ink2_moe_bucket_small"));
+          e.buf(0, eid_);
+          e.buf(1, ew_);
+          e.buf(2, moe_tiles_);
+          e.buf(3, moe_ntiles_);
+          e.buf(4, moe_st_tok_);
           e.buf(5, moe_st_pair_);
           e.buf(6, moe_st_ew_);
-          e.buf(7, moe_pair_out_);
-          e.val(8, mp);
-          e.dispatch((H + 31) / 32, max_e, 1, 128);
+          e.val(7, bp);
+          e.dispatch(1, 1, 1, 128);
+
+          const uint32_t max_e = std::min(uint32_t(cfg_.n_experts), uint32_t(T) * uint32_t(cfg_.top_k));
+          if (!L.is_mxfp8) {
+            e.use(ink2_pipe("ink2_moe_nvfp4_w13_g"));
+            e.buf(0, x_mlp_);
+            e.buf(1, L.w13->buf);
+            e.buf(2, L.w13_sc->buf);
+            e.buf(3, L.w13_outer);
+            e.buf(4, moe_tiles_);
+            e.buf(5, moe_ntiles_);
+            e.buf(6, moe_st_tok_);
+            e.buf(7, moe_st_pair_);
+            e.buf(8, moe_act_);
+            e.val(9, mp);
+            e.dispatch((uint32_t(cfg_.moe_I) + 15) / 16, max_e, 1, 128);
+
+            e.use(ink2_pipe("ink2_moe_nvfp4_w2_g"));
+            e.buf(0, moe_act_);
+            e.buf(1, L.w2->buf);
+            e.buf(2, L.w2_sc->buf);
+            e.buf(3, L.w2_outer);
+            e.buf(4, moe_tiles_);
+            e.buf(5, moe_ntiles_);
+            e.buf(6, moe_st_pair_);
+            e.buf(7, moe_st_ew_);
+            e.buf(8, moe_pair_out_);
+            e.val(9, mp);
+            e.dispatch((H + 15) / 16, max_e, 1, 128);
+          } else {
+            e.use(ink2_pipe("ink2_moe_mxfp8_w13_g"));
+            e.buf(0, x_mlp_);
+            e.buf(1, L.w13->buf);
+            e.buf(2, L.w13_sc->buf);
+            e.buf(3, moe_tiles_);
+            e.buf(4, moe_ntiles_);
+            e.buf(5, moe_st_tok_);
+            e.buf(6, moe_st_pair_);
+            e.buf(7, moe_act_);
+            e.val(8, mp);
+            e.dispatch((uint32_t(cfg_.moe_I) + 15) / 16, max_e, 1, 128);
+
+            e.use(ink2_pipe("ink2_moe_mxfp8_w2_g"));
+            e.buf(0, moe_act_);
+            e.buf(1, L.w2->buf);
+            e.buf(2, L.w2_sc->buf);
+            e.buf(3, moe_tiles_);
+            e.buf(4, moe_ntiles_);
+            e.buf(5, moe_st_pair_);
+            e.buf(6, moe_st_ew_);
+            e.buf(7, moe_pair_out_);
+            e.val(8, mp);
+            e.dispatch((H + 31) / 32, max_e, 1, 128);
+          }
+
+          e.use(ink2_pipe("ink2_moe_reduce8_m3"));
+          e.buf(0, moe_pair_out_);
+          e.buf(1, moe_out_);
+          e.val(2, mp);
+          e.dispatch(((H / 4) + 63) / 64, uint32_t(T), 1, 64);
+        } else if (!L.is_mxfp8) {
+          e.use(ink2_pipe("ink2_moe_nvfp4_w13_situ"));
+          e.buf(0, x_mlp_);
+          e.buf(1, eid_);
+          e.buf(2, L.w13->buf);
+          e.buf(3, L.w13_sc->buf);
+          e.buf(4, L.w13_outer);
+          e.buf(5, moe_act_);
+          e.val(6, mp);
+          e.dispatch((uint32_t(cfg_.moe_I) + 15) / 16, uint32_t(cfg_.top_k), uint32_t(T), 128);
+
+          e.use(ink2_pipe("ink2_moe_nvfp4_w2_acc"));
+          e.buf(0, moe_act_);
+          e.buf(1, eid_);
+          e.buf(2, ew_);
+          e.buf(3, L.w2->buf);
+          e.buf(4, L.w2_sc->buf);
+          e.buf(5, L.w2_outer);
+          e.buf(6, moe_out_);
+          e.val(7, mp);
+          e.dispatch((H + 7u) / 8u, uint32_t(T), 1, 128);
+        } else {
+          e.use(ink2_pipe("ink2_moe_mxfp8_w13_situ"));
+          e.buf(0, x_mlp_);
+          e.buf(1, eid_);
+          e.buf(2, L.w13->buf);
+          e.buf(3, L.w13_sc->buf);
+          e.buf(4, moe_act_);
+          e.val(5, mp);
+          e.dispatch((uint32_t(cfg_.moe_I) + 15) / 16, uint32_t(cfg_.top_k), uint32_t(T), 128);
+
+          e.use(ink2_pipe("ink2_moe_mxfp8_w2_acc"));
+          e.buf(0, moe_act_);
+          e.buf(1, eid_);
+          e.buf(2, ew_);
+          e.buf(3, L.w2->buf);
+          e.buf(4, L.w2_sc->buf);
+          e.buf(5, moe_out_);
+          e.val(6, mp);
+          e.dispatch((H + 15) / 16, uint32_t(T), 1, 128);
         }
-
-        e.use(ink2_pipe("ink2_moe_reduce8_m3"));
-        e.buf(0, moe_pair_out_);
-        e.buf(1, moe_out_);
-        e.val(2, mp);
-        e.dispatch(((H / 4) + 63) / 64, uint32_t(T), 1, 64);
-      } else if (!L.is_mxfp8) {
-        e.use(ink2_pipe("ink2_moe_nvfp4_w13_situ"));
-        e.buf(0, x_mlp_);
-        e.buf(1, eid_);
-        e.buf(2, L.w13->buf);
-        e.buf(3, L.w13_sc->buf);
-        e.buf(4, L.w13_outer);
-        e.buf(5, moe_act_);
-        e.val(6, mp);
-        e.dispatch((uint32_t(cfg_.moe_I) + 15) / 16, uint32_t(cfg_.top_k), uint32_t(T), 128);
-
-        e.use(ink2_pipe("ink2_moe_nvfp4_w2_acc"));
-        e.buf(0, moe_act_);
-        e.buf(1, eid_);
-        e.buf(2, ew_);
-        e.buf(3, L.w2->buf);
-        e.buf(4, L.w2_sc->buf);
-        e.buf(5, L.w2_outer);
-        e.buf(6, moe_out_);
-        e.val(7, mp);
-        e.dispatch((H + 7u) / 8u, uint32_t(T), 1, 128);
-      } else {
-        e.use(ink2_pipe("ink2_moe_mxfp8_w13_situ"));
-        e.buf(0, x_mlp_);
-        e.buf(1, eid_);
-        e.buf(2, L.w13->buf);
-        e.buf(3, L.w13_sc->buf);
-        e.buf(4, moe_act_);
-        e.val(5, mp);
-        e.dispatch((uint32_t(cfg_.moe_I) + 15) / 16, uint32_t(cfg_.top_k), uint32_t(T), 128);
-
-        e.use(ink2_pipe("ink2_moe_mxfp8_w2_acc"));
-        e.buf(0, moe_act_);
-        e.buf(1, eid_);
-        e.buf(2, ew_);
-        e.buf(3, L.w2->buf);
-        e.buf(4, L.w2_sc->buf);
-        e.buf(5, moe_out_);
-        e.val(6, mp);
-        e.dispatch((H + 15) / 16, uint32_t(T), 1, 128);
       }
     }
 
@@ -2122,7 +2187,7 @@ void Inkling2::enc_forward(Encoder& e, Seq& s, int pos0, int T, bool dump_logits
 
 void Inkling2::enc_sample(Encoder& e, Seq& s, const Buffer& lrow, const Buffer& tokens, int out_index,
                           const SamplingParams& sp, uint32_t step) {
-  (void)s;
+  enc_logit_mask(e, s, lrow, 1, cfg_.vocab, cfg_.vocab);
   if (full_vocab(sp)) {
     enc_sample_full(e, lrow, uint32_t(cfg_.vocab), tokens, out_index, sprob_, sp, step);
     return;
@@ -2342,7 +2407,7 @@ void Inkling2::encode_prefill_diag(Encoder& e, Seq& s, int pos0, int T, const Bu
 }
 
 int Inkling2::debug_tensor_unit_check() {
-  if (!use_tensor_) return 0;
+  if (!tensor_pf_) return 0;
   Gpu& g = Gpu::get();
   const uint32_t T = 96, H = uint32_t(cfg_.hidden);
   int fails = 0;
@@ -2368,11 +2433,29 @@ int Inkling2::debug_tensor_unit_check() {
     for (uint32_t i = 0; i < T * K; ++i) x_mlp_.as<float>()[i] = 0.25f * std::sin(float(i) * 0.013f);
     std::vector<float> ref(size_t(T) * N), ten(size_t(T) * N);
     const Ink2MmP mp{T, N, K, K, N, w.dtype == DType::F32 ? 1u : 0u, 0u};
+    const Ink2tGemmP gp{T, N, K, K, N, 0u, 0u, 0u, 0u};
     for (int arm = 0; arm < 2; ++arm) {
       auto e = g.begin();
-      e->use(arm ? ink2_tpipe("ink2_bf16_mm_t") : ink2_pipe("ink2_bf16_mm"));
-      e->buf(0, x_mlp_); e->buf(1, w.buf); e->buf(2, q_); e->val(3, mp);
-      e->dispatch((N + 63) / 64, (T + (arm ? 63u : 31u)) / (arm ? 64u : 32u), 1, 128);
+      if (arm) {
+        e->use(base_pipe("ink2_t_bf16_m64"));
+        e->buf(0, x_mlp_);
+        e->buf(1, w.buf);
+        e->buf(2, w.buf);
+        e->buf(3, q_);
+        e->val(4, gp);
+        e->buf(5, moe_tiles_);
+        e->buf(6, moe_ntiles_);
+        e->buf(7, moe_sorted_);
+        e->buf(8, x_mlp_);
+        e->dispatch((N + 63) / 64, (T + 63) / 64, 1, 128);
+      } else {
+        e->use(ink2_pipe("ink2_bf16_mm"));
+        e->buf(0, x_mlp_);
+        e->buf(1, w.buf);
+        e->buf(2, q_);
+        e->val(3, mp);
+        e->dispatch((N + 63) / 64, (T + 31) / 32, 1, 128);
+      }
       e->commit_and_wait();
       (arm ? ten : ref).assign(q_.as<float>(), q_.as<float>() + size_t(T) * N);
     }
@@ -2396,7 +2479,8 @@ int Inkling2::debug_tensor_unit_check() {
     e->commit_and_wait();
   }
   auto check_moe = [&](const char* label, const Ink2Layer& L) {
-    const Ink2MoeP mp{T, H, uint32_t(cfg_.moe_I), uint32_t(cfg_.top_k)};
+    const uint32_t I = uint32_t(cfg_.moe_I), K_top = uint32_t(cfg_.top_k), E = uint32_t(cfg_.n_experts);
+    const Ink2MoeP mp{T, H, I, K_top};
     std::vector<float> ref(T * H), ten(T * H);
     {
       auto e = g.begin();
@@ -2405,40 +2489,56 @@ int Inkling2::debug_tensor_unit_check() {
       e->buf(b++, x_mlp_); e->buf(b++, eid_); e->buf(b++, L.w13->buf); e->buf(b++, L.w13_sc->buf);
       if (!L.is_mxfp8) e->buf(b++, L.w13_outer);
       e->buf(b++, moe_act_); e->val(b, mp);
-      e->dispatch(L.is_mxfp8 ? (uint32_t(cfg_.moe_I) + 3) / 4 : (uint32_t(cfg_.moe_I) + 15) / 16, uint32_t(cfg_.top_k), T, 128);
+      e->dispatch((I + 15) / 16, K_top, T, 128);
       b = 0;
       e->use(ink2_pipe(L.is_mxfp8 ? "ink2_moe_mxfp8_w2_acc" : "ink2_moe_nvfp4_w2_acc"));
       e->buf(b++, moe_act_); e->buf(b++, eid_); e->buf(b++, ew_); e->buf(b++, L.w2->buf); e->buf(b++, L.w2_sc->buf);
       if (!L.is_mxfp8) e->buf(b++, L.w2_outer);
       e->buf(b++, moe_out_); e->val(b, mp);
-      e->dispatch((H + (L.is_mxfp8 ? 3u : 7u)) / (L.is_mxfp8 ? 4u : 8u), T, 1, 128);
+      e->dispatch((H + (L.is_mxfp8 ? 15u : 7u)) / (L.is_mxfp8 ? 16u : 8u), T, 1, 128);
       e->commit_and_wait();
       ref.assign(moe_out_.as<float>(), moe_out_.as<float>() + T * H);
     }
     {
+      const uint32_t P = T * K_top;
+      const uint32_t per = P / E;
+      const uint32_t bm = per >= 40 ? 64u : per >= 12 ? 32u : 16u;
+      const std::string ms = "_m" + std::to_string(bm);
+      const uint32_t max_tiles = P / bm + E + 1;
       auto e = g.begin();
-      const struct { uint32_t T, K_top, E; } bp{T, uint32_t(cfg_.top_k), uint32_t(cfg_.n_experts)};
-      e->use(ink2_tpipe("ink2_moe_bucket"));
-      e->buf(0, eid_); e->buf(1, ew_); e->buf(2, moe_tiles_); e->buf(3, moe_ntiles_);
-      e->buf(4, moe_st_tok_); e->buf(5, moe_st_pair_); e->buf(6, moe_st_ew_); e->val(7, bp);
-      e->dispatch(1, 1, 1, 128);
-      const uint32_t max_tiles = (T * uint32_t(cfg_.top_k) + 31u) / 32u + uint32_t(cfg_.n_experts);
-      int b = 0;
-      e->use(ink2_tpipe(L.is_mxfp8 ? "ink2_moe_mxfp8_w13_t" : "ink2_moe_nvfp4_w13_t"));
-      e->buf(b++, x_mlp_); e->buf(b++, L.w13->buf); e->buf(b++, L.w13_sc->buf);
-      if (!L.is_mxfp8) e->buf(b++, L.w13_outer);
-      e->buf(b++, moe_tiles_); e->buf(b++, moe_ntiles_); e->buf(b++, moe_st_tok_); e->buf(b++, moe_act_); e->val(b, mp);
-      e->dispatch((uint32_t(cfg_.moe_I) + 31) / 32, max_tiles, 1, 128);
-      b = 0;
-      e->use(ink2_tpipe(L.is_mxfp8 ? "ink2_moe_mxfp8_w2_t" : "ink2_moe_nvfp4_w2_t"));
-      e->buf(b++, moe_act_); e->buf(b++, L.w2->buf); e->buf(b++, L.w2_sc->buf);
-      if (!L.is_mxfp8) e->buf(b++, L.w2_outer);
-      e->buf(b++, moe_tiles_); e->buf(b++, moe_ntiles_); e->buf(b++, moe_st_pair_);
-      e->buf(b++, moe_st_ew_); e->buf(b++, moe_pair_out_); e->val(b, mp);
+      const Ink2BucketP bp{P, E, bm};
+      e->use(ink2_pipe("ink2_moe_bucket"));
+      e->buf(0, eid_); e->buf(1, moe_sorted_); e->buf(2, moe_tiles_); e->buf(3, moe_ntiles_);
+      e->buf(4, moe_rank_); e->val(5, bp);
+      e->dispatch(1, 1, 1, 256);
+
+      const uint32_t w13_q_stride = L.is_mxfp8 ? (2 * I * H) : (2 * I * (H / 2));
+      const uint32_t w13_s_stride = L.is_mxfp8 ? (2 * I * (H / 32)) : (2 * I * (H / 16));
+      const Ink2tGemmP gp13{P, 2 * I, H, H, 2 * I, 0u, w13_q_stride, w13_s_stride, K_top};
+      e->use(base_pipe((L.is_mxfp8 ? "ink2_t_mxfp8_moe_w13" : "ink2_t_nvfp4_moe_w13") + ms));
+      e->buf(0, x_mlp_); e->buf(1, L.w13->buf); e->buf(2, L.w13_sc->buf); e->buf(3, moe_tmp_);
+      e->val(4, gp13); e->buf(5, moe_tiles_); e->buf(6, moe_ntiles_); e->buf(7, moe_sorted_);
+      e->buf(8, L.is_mxfp8 ? x_mlp_ : L.w13_outer);
+      e->dispatch((2 * I + 63) / 64, max_tiles, 1, 128);
+
+      const Ink2SituP sp{P * I};
+      e->use(ink2_pipe("ink2_moe_situ_half"));
+      e->buf(0, moe_tmp_); e->buf(1, moe_act_h_); e->val(2, sp);
+      e->dispatch((sp.n + 255) / 256, 1, 1, 256);
+
+      const uint32_t w2_q_stride = L.is_mxfp8 ? (H * I) : (H * (I / 2));
+      const uint32_t w2_s_stride = L.is_mxfp8 ? (H * (I / 32)) : (H * (I / 16));
+      const Ink2tGemmP gp2{P, H, I, I, H, 0u, w2_q_stride, w2_s_stride, K_top};
+      e->use(base_pipe((L.is_mxfp8 ? "ink2_t_mxfp8_moe_w2" : "ink2_t_nvfp4_moe_w2") + ms));
+      e->buf(0, moe_act_h_); e->buf(1, L.w2->buf); e->buf(2, L.w2_sc->buf); e->buf(3, moe_tmp_);
+      e->val(4, gp2); e->buf(5, moe_tiles_); e->buf(6, moe_ntiles_); e->buf(7, moe_sorted_);
+      e->buf(8, L.is_mxfp8 ? x_mlp_ : L.w2_outer);
       e->dispatch((H + 63) / 64, max_tiles, 1, 128);
-      e->use(ink2_tpipe("ink2_moe_reduce8"));
-      e->buf(0, moe_pair_out_); e->buf(1, moe_out_); e->val(2, mp);
-      e->dispatch(((H / 4) + 63) / 64, T, 1, 64);
+
+      const Ink2CombineP cp{T, H, K_top};
+      e->use(ink2_pipe("ink2_moe_combine"));
+      e->buf(0, moe_tmp_); e->buf(1, ew_); e->buf(2, moe_out_); e->val(3, cp);
+      e->dispatch(T, 1, 1, 256);
       e->commit_and_wait();
       ten.assign(moe_out_.as<float>(), moe_out_.as<float>() + T * H);
     }
@@ -2468,10 +2568,10 @@ int Inkling2::debug_tensor_unit_check() {
     std::vector<float> ref(T * QD), ten(T * QD);
     for (int arm = 0; arm < 2; ++arm) {
       auto e = g.begin();
-      e->use(arm ? ink2_tpipe("ink2_attn_prefill_t") : ink2_pipe("ink2_attn_prefill"));
+      e->use(arm ? base_pipe("qattn_ink2_s6k32p") : ink2_pipe("ink2_attn_prefill"));
       e->buf(0, q_); e->buf(1, k_fp16); e->buf(2, v_fp16); e->buf(3, rb_);
       e->buf(4, sinks_); e->buf(5, gate_attn_); e->buf(6, att_out_); e->val(7, apf);
-      e->dispatch(arm ? (T + 15) / 16 : uint32_t(cfg_.hq), arm ? uint32_t(cfg_.hq) : T, 1, 128);
+      e->dispatch(arm ? (T + 31) / 32 : uint32_t(cfg_.hq), arm ? uint32_t(cfg_.hkv) : T, 1, arm ? 192 : 128);
       e->commit_and_wait();
       (arm ? ten : ref).assign(att_out_.as<float>(), att_out_.as<float>() + T * QD);
     }
