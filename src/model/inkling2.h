@@ -114,6 +114,7 @@ class Inkling2 : public Model {
   void set_mem_budget(size_t bytes) override { mem_budget_ = bytes; }
   std::unique_ptr<Seq> new_seq(int limit, int initial = -1) override;
   bool reserve(Seq& s, int need) override;
+  size_t kv_grow_held(const Seq& s) const override;
   void drop_kv(Seq& s) override;
   size_t kv_bytes_per_pos() const override;
   void reset(Seq& s) override;
@@ -153,6 +154,7 @@ class Inkling2 : public Model {
   bool ensure_rings(Seq& s);
   bool is_swa_slot(size_t slot) const;
   size_t kv_elem_bytes(size_t slot) const { return (use_kv_fp8_ && slot < cfg_.schedule.size()) ? 1u : 2u; }
+  size_t kv_grow_unit() const;
   void enc_forward(Encoder& e, Seq& s, int pos0, int T, bool dump_logits, const Buffer* out_logits, bool need_all_logits,
                    const Buffer* diag_rows = nullptr, bool capture_taps = false, bool save_conv_snaps = false,
                    const Buffer* tree_buf = nullptr);
