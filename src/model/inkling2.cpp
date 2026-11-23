@@ -10,6 +10,7 @@
 #include "util/bf16.h"
 #include "util/json_file.h"
 #include "util/log.h"
+#include "vision/embed.h"
 
 #include <nlohmann/json.hpp>
 
@@ -516,7 +517,7 @@ MemPlan Inkling2::plan(const std::string& dir, int prefill_chunk) {
   m.activations = act;
   m.hidden = c.hidden;
   m.layers = int(c.schedule.size());
-  m.formats = "NVFP4 (L0-19) + MXFP8 (L20-23) + BF16 dense (text-only)";
+  m.formats = "NVFP4 (L0-19) + MXFP8 (L20-23) + BF16 dense";
   return m;
 }
 
@@ -1397,6 +1398,7 @@ void Inkling2::enc_forward(Encoder& e, Seq& s, int pos0, int T, bool dump_logits
     e.val(4, ep);
     e.dispatch(uint32_t(T), 1, 1, std::min(512u, embed_pl.max_threads));
   }
+  if (s.embeds) vision::enc_embed_runs(e, *s.embeds, pos0, T, x_, cfg_.hidden);
   if (diag_rows) enc_copy_buf(e, x_.view(size_t(T - 1) * H * 4, H * 4), diag_rows->view(0, H * 4), H * 4);
 
   // Ping-pong active residual stream between x_ and inp_sa_ with zero extra copies.
@@ -2237,7 +2239,6 @@ void Inkling2::encode_prefill(Encoder& e, Seq& s, int pos0, int T, const Samplin
   if (T > tmax_) fatal("prefill chunk %d > %d", T, tmax_);
   if (pos0 + T >= s.cap) fatal("context full (%d)", s.cap);
   if (snap) fatal("inkling2: in-pass snapshots are not supported");
-  if (s.embeds) fatal("inkling2: image inputs are not supported in Stage 1");
   enc_forward(e, s, pos0, T, sample, nullptr, false, nullptr, mtp_ != nullptr, false);
   if (mtp_) mtp_->encode_commit_context(e, s, pos0, T, tap_[0], tap_[1], tap_[2], h_norm_);
   if (!sample) return;
